@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Datasets
+data/data_odometry_gray
+data/data_odometry_poses
+data/data_odometry_calib
+*.zip
+
