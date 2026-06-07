@@ -221,5 +221,6 @@ __marimo__/
 data/data_odometry_gray
 data/data_odometry_poses
 data/data_odometry_calib
+data/Kitti
 *.zip
 
