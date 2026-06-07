@@ -3,6 +3,7 @@ import time
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+from djitellopy import Tello
 
 
 # Data source management #
@@ -44,7 +45,6 @@ class KittiSource:
     
 class TelloSource:
     def __init__(self):
-        from djitellopy import Tello
         self.tello = Tello()
         self.tello.connect()
         self.tello.streamon()
@@ -59,6 +59,25 @@ class TelloSource:
         
         self.last_time = time.time()
         
+    def get_frame(self):
+        frame = self.frame_reader.frame
+        return frame
+    
+    def get_scale(self):
+        """Using IMU data from Tello drone to estimate the scale"""
+        dt = time.time() - self.last_time
+        self.last_time = time.time()
+        
+        # getting velocity in cm/s from IMU sensors
+        vx = self.tello.get_velocity_x()
+        vy = self.tello.get_velocity_y()
+        vz = self.tello.get_velocity_z()
+        print(f"Velocity X: {vx} cm/s, Y: {vy} cm/s, Z: {vz} cm/s")
+        
+        # Convert cm/s to meters/frame
+        speed_mps = np.sqrt(vx**2 + vy**2 + vz**2) / 100.0
+        scale = speed_mps * dt
+        return scale if scale > 0.005 else 0.0  # Threshold micro-noise when hovering
         
 def run_pipeline(mode="KITTI", data_path=None):
     # main program code #
