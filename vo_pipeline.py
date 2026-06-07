@@ -74,7 +74,7 @@ class TelloSource:
         
         print("Initializing camera video stream  ...")
         self.tello.streamon()
-        time.sleep(2.0) # delay for camera
+        time.sleep(5.0) # delay for camera
         
         print("Hao de!, stream is on!")
         
@@ -106,6 +106,17 @@ class TelloSource:
         speed_mps = np.sqrt(vx**2 + vy**2 + vz**2) / 100.0
         scale = speed_mps * dt
         return scale if scale > 0.005 else 0.0  # Threshold micro-noise when hovering
+    
+class Autohawk2ASource:
+    def __init__(self):
+        print("Attempting to connect to Autohawk2A")
+        
+    def get_frame(self):
+        print("getting frame")
+        
+    def get_scale(self):
+        dt = time.time() - self.last_time
+        self.last_time = time.time()
         
 def run_pipeline(mode="KITTI", data_path=None):
     # main program code #
