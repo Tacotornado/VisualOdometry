@@ -65,10 +65,18 @@ class KittiSource:
     
 class TelloSource:
     def __init__(self):
+        print(" Attempting to connect to Tello drone ...")
         self.tello = Tello()
         self.tello.connect()
+        
+        print("success: connected to drone")
+        print(f"Battery percentage at: {self.tello.get_battery()}%")
+        
+        print("Initializing camera video stream  ...")
         self.tello.streamon()
         time.sleep(2.0) # delay for camera
+        
+        print("Hao de!, stream is on!")
         
         self.frame_reader = self.tello.get_frame_read()
         
