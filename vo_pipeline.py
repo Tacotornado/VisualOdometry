@@ -10,19 +10,39 @@ from djitellopy import Tello
 
 class KittiSource:
     def __init__(self, sequence_path):
-        self.img_dir = os.path.join(sequence_path, "image_0")
-        self.images = sorted([os.path.join(self.img_dir, f) for f in os.listdir(self.img_dir)])
-        self.idx = 0
-        
-        # loading ground truths
-        
-        gt_path = os.path.join(sequence_path, "poses.txt")
-        self.gt_poses = np.loadtxt(gt_path, dtype=float) if os.path.exists(gt_path) else None
-        
-        # KITTI Intrinsics
-        self.K = np.array([[718.856,   0.0,   607.1928],
-                           [  0.0,   718.856, 185.2157],
-                           [  0.0,     0.0,     1.0]])
+            # 1. Update image path to match your "images" folder
+            self.img_dir = os.path.join(sequence_path, "images")
+            self.images = sorted([os.path.join(self.img_dir, f) for f in os.listdir(self.img_dir) if f.endswith(('.png', '.jpg', '.jpeg'))])
+            self.idx = 0
+            
+            # 2. Update to match your "ground_truth.txt" file name
+            gt_path = os.path.join(sequence_path, "ground_truth.txt")
+            self.gt_poses = np.loadtxt(gt_path, dtype=float) if os.path.exists(gt_path) else None
+            
+            # 3. Parse your specific "calib.txt" dynamically if it's there, 
+            # otherwise fallback to default KITTI intrinsics
+            calib_path = os.path.join(sequence_path, "calib.txt")
+            self.K = self._load_intrinsics(calib_path)
+
+    def _load_intrinsics(self, calib_path):
+        """Attempts to parse calib.txt. If formatting differs, falls back to baseline."""
+        try:
+            if os.path.exists(calib_path):
+                with open(calib_path, 'r') as f:
+                    first_line = f.readline().strip().split()
+                # Check if it's a standard KITTI 12-element projection row
+                if len(first_line) >= 12:
+                    # If it starts with an identifier like 'P0:', drop it
+                    data = [float(x) for x in first_line[1:]] if ':' in first_line[0] else [float(x) for x in first_line]
+                    P = np.array(data[:12]).reshape(3, 4)
+                    return P[:, :3] # Return the 3x3 Intrinsic matrix K
+        except Exception as e:
+            print(f"Warning: Could not parse calib.txt ({e}). Using default KITTI matrix.")
+            
+        # Default fallback KITTI Intrinsics matrix
+        return np.array([[718.856,   0.0,   607.1928],
+                        [  0.0,   718.856, 185.2157],
+                        [  0.0,     0.0,     1.0]])
         
     def get_frame(self):
         if self.idx >= len(self.images):
@@ -86,14 +106,111 @@ def run_pipeline(mode="KITTI", data_path=None):
             source = KittiSource(data_path)
         elif mode == "TELLO":
             print("Processing Tello feed")
+            source = TelloSource()
         elif mode == "Airsim":
             print("Processing Airsim feed")
+            return
+        else:
+            print("unknown feed")
+            return
+        
+        # Trajectory State matrix setups
+        cur_R = np.eye(3)
+        cur_t = np.zeros((3, 1))
+        
+        # Storage of traversed positions for plotting shit live
+        traj_x, traj_z = [0], [0]
+        
+        plt.ion()
+        fig, ax = plt.subplots()
+        line, = ax.plot([], [], 'ro-', label="Tracked Path")
+        ax.legend()
+        ax.grid(True)
+        
+        # Processing frame 0
+        frame_prev = source.get_frame()
+        if frame_prev is None: 
+            print("Error: could not read first frame.")
+            return
+        gray_prev = cv2.cvtColor(frame_prev, cv2.COLOR_BGR2GRAY)
+        
+        # initial feature detection
+        pts_prev = cv2.goodFeaturesToTrack(gray_prev, maxCorners=1000, qualityLevel=0.01, minDistance=10)
+        
+        while True:
+            frame_curr = source.get_frame()
+            if frame_curr is None:
+                break
+            
+            gray_curr = cv2.cvtColor(frame_curr, cv2.COLOR_BGR2GRAY)
+            scale = source.get_scale()
+            
+            # feature tracking part with optical flow
+            pts_curr, status, _ = cv2.calcOpticalFlowPyrLK(gray_prev, gray_curr, pts_prev, None)
+            
+            # redetect features if lost optical flow
+            if pts_curr is None or status is None:
+                pts_curr = cv2.goodFeaturesToTrack(gray_curr, maxCorners=1000, qualityLevel=0.01, minDistance=10)
+                gray_prev = gray_curr
+                pts_prev = pts_curr
+                continue
+            
+            # good_prev =  pts_prev[status[:, 0] == 1]
+            # good_curr =  pts_curr[status[:, 0] == 1]
+            
+            good_prev = pts_prev[status.ravel() == 1]
+            good_curr = pts_curr[status.ravel() == 1]
+            
+            if len(good_curr) > 10:
+                # Estimate Essential Matrix and Essential Motion
+                E, mask = cv2.findEssentialMat(good_curr, good_prev, source.K, method=cv2.RANSAC, prob=0.99, threshold=1.0)
+                _, R, t, _ = cv2.recoverPose(E, good_curr, good_prev, source.K, mask=mask)
+
+                # Accumulate pose if the drone actually moved
+                if scale > 0.0:
+                    cur_t = cur_t + scale * cur_R.dot(t)
+                    cur_R = R.dot(cur_R)
+
+                # Update live plotting lists (mapping 3D coordinates to a 2D floor plan)
+                traj_x.append(cur_t[0, 0])
+                traj_z.append(cur_t[2, 0])
+                
+                # Dynamic map scaling
+                line.set_data(traj_x, traj_z)
+                ax.relim()
+                ax.autoscale_view()
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+                plt.pause(0.01)
+
+            # Visual Diagnostics Window
+            frame_vis = frame_curr.copy()
+            for pt in good_curr:
+                x, y = pt.ravel()
+                cv2.circle(frame_curr, (int(x), int(y)), 3, (0, 255, 0), -1)
+            cv2.imshow("VO Camera Feed", frame_curr)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+            # Refresh tracking points if they drop too low
+            if len(good_curr) < 200:
+                pts_curr = cv2.goodFeaturesToTrack(gray_curr, maxCorners=1000, qualityLevel=0.01, minDistance=10)
+                
+            gray_prev = gray_curr
+            pts_prev = pts_curr
+
+        cv2.destroyAllWindows()
+        plt.ioff()
+        plt.show()
+            
             
 if __name__ == "__main__":
     # --- For Testing KITTI ---
-    # Downoad a sequence and change this path to point to your data folder
-    kitti_sequence_directory = "C:/data/KITTI_sequence_1/"
+    # Download a sequence and change this path to point to your data folder
+    kitti_sequence_directory = "./data/Kitti/flight_path_00"
     run_pipeline(mode="KITTI", data_path=kitti_sequence_directory)
+    # run_pipeline(mode="TELLO")
     
     # --- For Live Flight with the Drone ---
     # 1. Turn on Tello and connect laptop Wi-Fi to it.
