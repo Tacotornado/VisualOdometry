@@ -96,10 +96,20 @@ class TelloSource:
         dt = time.time() - self.last_time
         self.last_time = time.time()
         
-        # getting velocity in cm/s from IMU sensors
-        vx = self.tello.get_velocity_x()
-        vy = self.tello.get_velocity_y()
-        vz = self.tello.get_velocity_z()
+        try:
+            state = self.tello.get_current_state()
+            
+            vx = int(state.get('vgx', 0))
+            vy = int(state.get('vgy', 0))
+            vz = int(state.get('vgz', 0))
+        except:
+            vx, vy, vz = 0, 0, 0,
+            print("Exception: velocities not found, fallback placeholder used")
+        
+            # getting velocity in cm/s from IMU sensors
+            # vx = self.tello.get_velocity_x()
+            # vy = self.tello.get_velocity_y()
+            # vz = self.tello.get_velocity_z()
         print(f"Velocity X: {vx} cm/s, Y: {vy} cm/s, Z: {vz} cm/s")
         
         # Convert cm/s to meters/frame
