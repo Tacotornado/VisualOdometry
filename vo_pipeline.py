@@ -214,6 +214,6 @@ if __name__ == "__main__":
     
     # --- For Live Flight with the Drone ---
     # 1. Turn on Tello and connect laptop Wi-Fi to it.
-    # 2. Pip install djitelloapy
+    # 2. Pip install djitellopy
     # 3. Comment out the KITTI run above and uncomment the line below:
     # run_pipeline(mode="TELLO")
