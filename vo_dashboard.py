@@ -146,8 +146,11 @@ class VODashboardApp:
     def worker_thread_loop(self, config, data_q):
         """Runs isolated away from UI. Calls backend pipeline."""
         try:
-            # Passes execution down matching parameter expectations
-            run_pipeline(mode=config["mode"], data_path=None, shared_queue=data_q)
+            # --- FIXED: Point to your exact image sequences folder directory ---
+            kitti_path = "./data/Kitti/flight_path_00" 
+            
+            # Passes execution down matching parameter expectations safely
+            run_pipeline(mode=config["mode"], data_path=kitti_path, shared_queue=data_q)
         except Exception as e:
             print(f"Engine Thread Crash: {e}")
         finally:
@@ -155,15 +158,15 @@ class VODashboardApp:
 
     def poll_queue_updates(self):
         """Drains data items from the worker thread to safely redraw widgets"""
+        packet = None
         try:
-            packet = None
-            # Drain queue to catch the latest frame packet quickly
+            # Drain queue completely to parse the newest incoming packet data frame
             while True:
                 packet = self.data_queue.get_nowait()
-                if "estimated" in packet: 
+                if packet and "estimated" in packet: 
                     self.estimated_vo_history.append(packet["estimated"])
         except queue.Empty:
-            pass # Queue caught up entirely for this tick cycle
+            pass  # Queue caught up entirely for this tick cycle
             
         # If we received data this loop cycle, paint it straight onto UI widgets
         if packet is not None:
