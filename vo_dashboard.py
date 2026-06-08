@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-import threading
+import multiprocessing  # FIXED: Swapped out threading for true process isolation
 import queue
 import time
 import os
@@ -39,9 +39,9 @@ class VODashboardApp:
         self.style.configure("Cyan.Horizontal.TProgressbar", troughcolor=self.bg_color, background=self.accent_cyan, thickness=15)
 
         # --- STATE MANAGEMENT ---
-        self.vo_thread = None
+        self.vo_process = None  # FIXED: Changed from thread to process
         self.running = False
-        self.data_queue = queue.Queue()
+        self.data_queue = None  # Instantiated at runtime using multiprocessing.Queue()
         self.start_time = 0
         
         # Purely tracking the actual calculated real positions
@@ -115,13 +115,14 @@ class VODashboardApp:
     # --- CONTROLLER METHODS ---
     
     def start_vo_engine(self):
-        """Instantiates tracking queues and fires up the background pipeline thread"""
+        """Instantiates tracking queues and fires up the background pipeline process"""
         self.running = True
         self.start_time = time.time()
         self.estimated_vo_history.clear()
-        self.data_queue = queue.Queue()
         
-        # Read user configurations from entries safely
+        # FIXED: Use a Multiprocessing Queue to bridge separate core memories safely
+        self.data_queue = multiprocessing.Queue()
+        
         config = {
             "mode": self.mode_var.get(),
             "max_features": int(self.entries["max_features"].get()),
@@ -130,34 +131,25 @@ class VODashboardApp:
             "ransac_thresh": float(self.entries["ransac_thresh"].get())
         }
         
-        # Switch button availability constraints
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         self.lbl_status.config(text="Engine Status: RUNNING...", fg=self.accent_cyan)
         
-        # Launch Worker Thread
-        self.vo_thread = threading.Thread(target=self.worker_thread_loop, args=(config, self.data_queue))
-        self.vo_thread.daemon = True
-        self.vo_thread.start()
+        # FIXED: Launch true Process instead of Thread to prevent GUI freezing
+        self.vo_process = multiprocessing.Process(
+            target=worker_process_wrapper, 
+            args=(config, self.data_queue)
+        )
+        self.vo_process.start()
         
         # Begin checking the communication queue loop inside the main interface frame
         self.root.after(50, self.poll_queue_updates)
 
-    def worker_thread_loop(self, config, data_q):
-        """Runs isolated away from UI. Calls backend pipeline."""
-        try:
-            # --- FIXED: Point to your exact image sequences folder directory ---
-            kitti_path = "./data/Kitti/flight_path_00" 
-            
-            # Passes execution down matching parameter expectations safely
-            run_pipeline(mode=config["mode"], data_path=kitti_path, shared_queue=data_q)
-        except Exception as e:
-            print(f"Engine Thread Crash: {e}")
-        finally:
-            self.running = False
-
     def poll_queue_updates(self):
-        """Drains data items from the worker thread to safely redraw widgets"""
+        """Drains data items from the worker process to safely redraw widgets"""
+        if self.data_queue is None:
+            return
+
         packet = None
         try:
             # Drain queue completely to parse the newest incoming packet data frame
@@ -184,20 +176,26 @@ class VODashboardApp:
             self.lbl_fps.config(text=f"Processing Speed: {fps:.1f} Frames/sec")
             self.lbl_status.config(text=f"Engine Status: Frame {frame_idx}/{total_frames}")
             
-        # If thread stopped processing and queue emptied out, wrap things up safely
-        if not self.running and self.data_queue.empty():
+        # FIXED: Track process life dynamically rather than relying on shared booleans
+        process_alive = self.vo_process and self.vo_process.is_alive()
+
+        if not process_alive and self.data_queue.empty():
+            self.running = False
             self.wrap_up_pipeline()
             return
             
         # Reschedule check loop to execute again in 50 milliseconds
-        if self.running:
+        if self.running or process_alive:
             self.root.after(50, self.poll_queue_updates)
 
     def stop_vo_engine(self):
-        """Forces runtime cancellation signals to the background execution loop"""
+        """Forces immediate runtime termination signals to the background process"""
         self.running = False
+        if self.vo_process and self.vo_process.is_alive():
+            self.vo_process.terminate()  # FIXED: Hard-kills the frozen pipeline process instantly
+            self.vo_process.join()
+        
         self.lbl_status.config(text="Engine Status: ABORTED", fg=self.accent_pink)
-        cv2.destroyAllWindows()
         self.wrap_up_pipeline()
 
     def wrap_up_pipeline(self):
@@ -207,7 +205,7 @@ class VODashboardApp:
         
         if len(self.estimated_vo_history) > 2:
             self.lbl_status.config(text="Engine Status: SUCCESS", fg="#22c55e")
-            self.generate_trajectory_plot()
+            self.root.after(100, self.generate_trajectory_plot)
         else:
             self.lbl_status.config(text="Engine Status: STANDBY", fg=self.text_color)
 
@@ -221,19 +219,14 @@ class VODashboardApp:
             messagebox.showinfo("Data Saved", "Flight tracking complete. Path data empty.")
             return
 
-        # Build 3D Matplotlib Figure
         fig = plt.figure(figsize=(8, 6))
         ax = fig.add_subplot(111, projection='3d')
         fig.suptitle("AUTOHAWK 3D FLIGHT TRAJECTORY", fontsize=12, fontweight='bold')
         
-        # Plot the path line (X, Z, Y mapping for standard drone frame spatial dynamics)
         ax.plot(est[:, 0], est[:, 2], est[:, 1], color="#00f0ff", linewidth=2, label="Calculated VO Path")
-        
-        # Mark the takeoff point and current position point explicitly
         ax.scatter(0, 0, 0, color="green", s=100, label="Takeoff Pad (Origin)")
         ax.scatter(est[-1, 0], est[-1, 2], est[-1, 1], color="#ff007f", s=100, label="Final Drone Position")
         
-        # Grid aesthetics
         ax.set_xlabel("X Position - Lateral (m)")
         ax.set_ylabel("Z Position - Depth (m)")
         ax.set_zlabel("Y Position - Altitude (m)")
@@ -243,7 +236,19 @@ class VODashboardApp:
         plt.tight_layout()
         plt.show()
 
+# FIXED: Standard standalone function outside of class space to allow multiprocessing serialization
+def worker_process_wrapper(config, data_q):
+    """Isolated process code executed entirely separate from Tkinter UI thread"""
+    try:
+        kitti_path = "./data/Kitti/flight_path_00" if config["mode"] == "KITTI" else None
+        run_pipeline(mode=config["mode"], data_path=kitti_path, shared_queue=data_q)
+    except Exception as e:
+        print(f"Engine Process Crash: {e}")
+
 if __name__ == "__main__":
+    # CRITICAL: Fixes multiprocessing instantiation context rules across Windows/macOS platforms
+    multiprocessing.freeze_support()
+    
     root = tk.Tk()
     app = VODashboardApp(root)
     root.mainloop()
