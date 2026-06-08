@@ -62,9 +62,17 @@ class TelloSource:
         print("success: connected to drone")
         print(f"Battery percentage at: {self.tello.get_battery()}%")
         
+        # --- OPTIMIZATION 1: Throttle video encoder stream profiles to eliminate network lag ---
+        try:
+            self.tello.set_video_bitrate(Tello.VIDEO_BITRATE_1Mbps)
+            self.tello.set_video_fps(Tello.VIDEO_FPS_15)
+            print("Video stream optimized: 1Mbps, 15 FPS profile activated.")
+        except Exception as e:
+            print(f"Warning: Could not apply bitrate/FPS optimizations: {e}")
+        
         print("Initializing camera video stream ...")
         self.tello.streamon()
-        time.sleep(5.0)
+        time.sleep(3.0)
         
         print("Hao de!, stream is on!")
         self.frame_reader = self.tello.get_frame_read()
@@ -186,6 +194,11 @@ def run_pipeline(mode="KITTI", data_path=None, shared_queue=None):
     
     cur_R = np.eye(3)
     cur_t = np.zeros((3, 1))
+    
+    # --- OPTIMIZATION 2: Telemetry State Filtering Variables ---
+    smooth_t = np.zeros((3, 1))
+    alpha = 0.25  # Exponential Moving Average smoothing multiplier (Low-pass filter coefficient)
+    
     traj_x, traj_z = [0], [0]
     
     frame_counter = 0
@@ -194,7 +207,6 @@ def run_pipeline(mode="KITTI", data_path=None, shared_queue=None):
     if mode == "KITTI" and data_path and os.path.exists(data_path):
         estimated_total_frames = len(os.listdir(data_path))
     
-    # Hide desktop windows completely if running through a multiprocessing queue
     show_local_plots = (shared_queue is None)
     
     if show_local_plots:
@@ -204,7 +216,6 @@ def run_pipeline(mode="KITTI", data_path=None, shared_queue=None):
         ax.legend()
         ax.grid(True)
     
-    # --- FIX: Cycle frames until the drone camera sensor returns an actual valid picture ---
     frame_prev = None
     print("Waiting for stable camera feed initialization...")
     for _ in range(30):
@@ -229,7 +240,6 @@ def run_pipeline(mode="KITTI", data_path=None, shared_queue=None):
         gray_curr = cv2.cvtColor(frame_curr, cv2.COLOR_BGR2GRAY)
         scale = source.get_scale()
         
-        # --- FIX: Guard block against empty tracking vectors before launching optical flow ---
         if pts_prev is None or len(pts_prev) == 0:
             pts_prev = cv2.goodFeaturesToTrack(gray_prev, maxCorners=1000, qualityLevel=0.01, minDistance=10)
             gray_prev = gray_curr
@@ -246,7 +256,6 @@ def run_pipeline(mode="KITTI", data_path=None, shared_queue=None):
         good_prev = pts_prev[status.ravel() == 1]
         good_curr = pts_curr[status.ravel() == 1]
         
-        # --- FIX: Only calculate essential matrix if enough keypoints survived RANSAC filtering ---
         if len(good_curr) > 10:
             E, mask = cv2.findEssentialMat(good_curr, good_prev, source.K, method=cv2.RANSAC, prob=0.99, threshold=1.0)
             if E is not None and E.shape == (3, 3):
@@ -264,16 +273,17 @@ def run_pipeline(mode="KITTI", data_path=None, shared_queue=None):
                     
                     cur_R = R.dot(cur_R)
         
-        traj_x.append(cur_t[0, 0])
-        traj_z.append(cur_t[2, 0])
+        # --- OPTIMIZATION 3: Apply filter equations to smooth out jitter peaks ---
+        smooth_t = alpha * cur_t + (1.0 - alpha) * smooth_t
         
-        # Superimpose feature tracking markers directly on frame
+        traj_x.append(smooth_t[0, 0])
+        traj_z.append(smooth_t[2, 0])
+        
         frame_vis = frame_curr.copy()
         for pt in good_curr:
             x, y = pt.ravel()
             cv2.circle(frame_vis, (int(x), int(y)), 3, (0, 255, 0), -1)
 
-        # Draw local troubleshooting windows if running solo script
         if show_local_plots:
             line.set_data(traj_x, traj_z)
             ax.relim()
@@ -284,13 +294,12 @@ def run_pipeline(mode="KITTI", data_path=None, shared_queue=None):
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-        # Send telemetry and frame package down the pipeline queue
         if shared_queue is not None:
-            real_x = float(cur_t[0, 0])
-            real_y = -float(cur_t[1, 0])  # Normalizes climbing axis upward
-            real_z = float(cur_t[2, 0])
+            # Pass the heavily filtered position arrays down the queue instead of raw noisy coordinates
+            real_x = float(smooth_t[0, 0])
+            real_y = -float(smooth_t[1, 0])  
+            real_z = float(smooth_t[2, 0])
             
-            # Encode visual frame matrix to byte stream for robust multiprocessing transfer
             _, encoded_img = cv2.imencode('.jpg', frame_vis)
             jpeg_bytes = encoded_img.tobytes()
             
@@ -298,7 +307,7 @@ def run_pipeline(mode="KITTI", data_path=None, shared_queue=None):
                 "frame_idx": frame_counter,
                 "total_frames": estimated_total_frames,
                 "estimated": [real_x, real_y, real_z],
-                "distance_from_start": float(np.linalg.norm(cur_t)),
+                "distance_from_start": float(np.linalg.norm(smooth_t)),
                 "video_frame": jpeg_bytes
             })
 
