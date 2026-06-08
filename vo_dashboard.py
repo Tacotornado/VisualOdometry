@@ -200,6 +200,9 @@ class VODashboardApp:
 
     def wrap_up_pipeline(self):
         """Restores system control triggers and prints out performance figures"""
+        if self.btn_start['state'] == tk.NORMAL:
+            return  # Core has already wrapped up, abort duplicate call!
+
         self.btn_start.config(state=tk.NORMAL)
         self.btn_stop.config(state=tk.DISABLED)
         
@@ -212,26 +215,70 @@ class VODashboardApp:
     # --- TRUE 3D SPATIAL PATH PLOTTING ---
 
     def generate_trajectory_plot(self):
-        """Generates a true 3D spatial plot of the traversed flight path"""
+        """Generates an intuitive, depth-cued 3D spatial plot of the flight path"""
         est = np.array(self.estimated_vo_history)
         
         if est.ndim < 2 or len(est) < 2:
             messagebox.showinfo("Data Saved", "Flight tracking complete. Path data empty.")
             return
 
-        fig = plt.figure(figsize=(8, 6))
+        # Extract standard drone reference positions
+        # x = Lateral (Left/Right), y = Altitude (Up/Down), z = Depth (Forward/Backward)
+        x_coords = est[:, 0]
+        y_coords = est[:, 1]
+        z_coords = est[:, 2]
+
+        # Create the figure with a dark cyberpunk-friendly aesthetic
+        plt.style.use('dark_background')
+        fig = plt.figure(figsize=(10, 8))
         ax = fig.add_subplot(111, projection='3d')
-        fig.suptitle("AUTOHAWK 3D FLIGHT TRAJECTORY", fontsize=12, fontweight='bold')
+        fig.suptitle("AUTOHAWK // VISUAL ODOMETRY FLIGHT PATH", fontsize=12, fontweight='bold', color="#00f0ff")
         
-        ax.plot(est[:, 0], est[:, 2], est[:, 1], color="#00f0ff", linewidth=2, label="Calculated VO Path")
-        ax.scatter(0, 0, 0, color="green", s=100, label="Takeoff Pad (Origin)")
-        ax.scatter(est[-1, 0], est[-1, 2], est[-1, 1], color="#ff007f", s=100, label="Final Drone Position")
+        # --- VISUAL UPGRADE 1: Color-Coded Progress Gradient ---
+        # Maps the trajectory line over time from electric cyan to hot pink
+        num_points = len(est)
+        colors = plt.cm.cool(np.linspace(0, 1, num_points))
         
-        ax.set_xlabel("X Position - Lateral (m)")
-        ax.set_ylabel("Z Position - Depth (m)")
-        ax.set_zlabel("Y Position - Altitude (m)")
-        ax.grid(True, linestyle=":")
-        ax.legend()
+        for i in range(num_points - 1):
+            ax.plot(x_coords[i:i+2], z_coords[i:i+2], y_coords[i:i+2], 
+                    color=colors[i], linewidth=2.5, alpha=0.9)
+
+        # --- VISUAL UPGRADE 2: Floor Drop-Shadow Projection ---
+        # Spits a gray/faded trace on the ground plane to give an instant depth cue
+        floor_level = np.min(y_coords) - 1.0  # Set floor slightly below the lowest altitude point
+        ax.plot(x_coords, z_coords, zs=floor_level, zdir='z', 
+                color="#3a2f6b", linestyle="--", linewidth=1.5, alpha=0.6, label="Ground Projection Track")
+
+        # Mark key operational milestones explicitly
+        ax.scatter(x_coords[0], z_coords[0], y_coords[0], color="#22c55e", s=120, edgecolors='w', label="Takeoff Pad (Origin)")
+        ax.scatter(x_coords[-1], z_coords[-1], y_coords[-1], color="#ff007f", s=120, edgecolors='w', label="Current Drone Position")
+        
+        # Add subtle dotted projection lines connecting the current position straight to the floor
+        ax.plot([x_coords[-1], x_coords[-1]], [z_coords[-1], z_coords[-1]], [floor_level, y_coords[-1]], 
+                color="#ff007f", linestyle=":", linewidth=1.5)
+
+        # Labels and Spatial Dynamics
+        ax.set_xlabel("X - Lateral (meters)", labelpad=10, color="#ffffff")
+        ax.set_ylabel("Z - Depth (meters)", labelpad=10, color="#ffffff")
+        ax.set_zlabel("Y - Altitude (meters)", labelpad=10, color="#ffffff")
+        
+        # --- VISUAL UPGRADE 3: Set Equal Axis Scaling ---
+        # Prevents Matplotlib from warping stretching physical proportions distortedly
+        max_range = np.array([x_coords.max()-x_coords.min(), z_coords.max()-z_coords.min(), y_coords.max()-y_coords.min()]).max() / 2.0
+        mid_x = (x_coords.max()+x_coords.min()) * 0.5
+        mid_y = (y_coords.max()+y_coords.min()) * 0.5
+        mid_z = (z_coords.max()+z_coords.min()) * 0.5
+        ax.set_xlim(mid_x - max_range, mid_x + max_range)
+        ax.set_ylim(mid_z - max_range, mid_z + max_range)
+        ax.set_zlim(mid_y - max_range, mid_y + max_range)
+
+        # Clean background pane colors to match the dashboard aesthetic
+        ax.xaxis.set_pane_color((0.07, 0.05, 0.18, 1.0))
+        ax.yaxis.set_pane_color((0.07, 0.05, 0.18, 1.0))
+        ax.zaxis.set_pane_color((0.10, 0.08, 0.23, 1.0))
+        
+        ax.grid(True, linestyle=":", alpha=0.3, color="#00f0ff")
+        ax.legend(loc="upper left")
         
         plt.tight_layout()
         plt.show()
