@@ -176,7 +176,7 @@ class VODashboardApp:
             self.lbl_fps.config(text=f"Processing Speed: {fps:.1f} Frames/sec")
             self.lbl_status.config(text=f"Engine Status: Frame {frame_idx}/{total_frames}")
             
-        # FIXED: Track process life dynamically rather than relying on shared booleans
+        # Track process life dynamically rather than relying on shared booleans
         process_alive = self.vo_process and self.vo_process.is_alive()
 
         if not process_alive and self.data_queue.empty():
@@ -283,7 +283,7 @@ class VODashboardApp:
         plt.tight_layout()
         plt.show()
 
-# FIXED: Standard standalone function outside of class space to allow multiprocessing serialization
+# Standard standalone function outside of class space to allow multiprocessing serialization
 def worker_process_wrapper(config, data_q):
     """Isolated process code executed entirely separate from Tkinter UI thread"""
     try:
@@ -293,7 +293,7 @@ def worker_process_wrapper(config, data_q):
         print(f"Engine Process Crash: {e}")
 
 if __name__ == "__main__":
-    # CRITICAL: Fixes multiprocessing instantiation context rules across Windows/macOS platforms
+    # multiprocessing instantiation context rules across Windows/macOS platforms
     multiprocessing.freeze_support()
     
     root = tk.Tk()
