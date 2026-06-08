@@ -3,6 +3,8 @@ import time
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import socket
+import urllib.request
 from djitellopy import Tello
 
 
@@ -118,15 +120,93 @@ class TelloSource:
         return scale if scale > 0.005 else 0.0  # Threshold micro-noise when hovering
     
 class Autohawk2ASource:
-    def __init__(self):
-        print("Attempting to connect to Autohawk2A")
+    def __init__(self, drone_ip="192.168.4.1", video_port=80, cmd_port=8081):
+        self.drone_ip = drone_ip
+        self.video_port = video_port
+        self.cmd_port = cmd_port
+        print(f"Attempting to connect to Autohawk2A at {self.drone_ip}...")
         
+        self.stream_url = f"http://{self.drone_ip}:{self.video_port}/stream"
+        try:
+            self.stream = urllib.request.urlopen(self.stream_url, timeout=5)
+            print("Video stream connected successfully")
+        except Exception as e:
+            print(f"Error connecting to video stream: {e}")
+            self.stream = None
+        
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
+        self.sock.setblocking(False)
+        try:
+            # Listen on all local interfaces on your specified port
+            self.sock.bind(("", self.cmd_port))
+        except Exception as e:
+            print(f"Warning on UDP socket binding: {e}")
+            
+        # Camera Intrinsics for the OV2640 Sensor on the XIAO Sense
+        # Note: These are rough baselines for an OV2640 lens at 640x480. 
+        # We should calibrate this using a checkerboard later
+        self.K = np.array([[500.0,    0.0,  320.0],
+                           [  0.0,  500.0,  240.0],
+                           [  0.0,    0.0,    1.0]])
+        
+        self.bytes_buffer = bytes()
+        self.last_time = time.time()
+                    
     def get_frame(self):
-        print("getting frame")
+        if self.stream is None:
+            return None
+        try:
+            while True:
+                # reading data chunks from net stream
+                self.bytes_buffer += self.stream.read(1024)
+                
+                a = self.bytes_buffer.find(b'\xff\xd8')
+                b = self.bytes_buffer.find(b'\xff\xd9')
+                
+                if a != -1 and b != -1 and b > a:
+                    jpg = self.bytes_buffer[a:b+2]
+                    self.bytes_buffer = self.bytes_buffer[b+2:]
+                    
+                    frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    return frame
+                
+        except Exception as e:
+            print(f"Failed to read camera byte frame: {e}")
+            return None
+            
+        
         
     def get_scale(self):
         dt = time.time() - self.last_time
         self.last_time = time.time()
+        
+        vx, vy, vz = 0.0, 0.0, 0.0
+        
+        try:
+            while True:
+                data, addr = self.sock.recvfrom(1024)
+                packet_str = data.decode('utf-8').strip()
+                
+                # Assuming the ESP32 streams text data formatted as comma-separated values: "vx,vy,vz"
+                # Example ESP32 code: Serial1.printf("%f,%f,%f\n", vx, vy, vz);
+                parts = packet_str.split(',')
+                if len(parts) >= 3:
+                    vx = float(parts[0])
+                    vy = float(parts[1])
+                    vz = float(parts[2])
+                    
+        except BlockingIOError:
+            # No UDP packet arrived since last check
+            # should occur every so often
+            pass
+        except Exception as e:
+            print(f"Telemetry decoding failed: {e}")
+            
+        speed_mps = np.sqrt(vx**2 + vy**2 + vz**2)
+        scale = speed_mps * dt
+        
+        return scale if scale > 0.001 else 0.0
         
 def run_pipeline(mode="KITTI", data_path=None):
     # main program code #
@@ -139,6 +219,9 @@ def run_pipeline(mode="KITTI", data_path=None):
         elif mode == "Airsim":
             print("Processing Airsim feed")
             return
+        elif mode == "AUTOHAWK2A":
+            print("Processing Autohawk2A feed")
+            source = Autohawk2ASource(drone_ip="192.168.4.1", video_port=80, cmd_port=8081)
         else:
             print("unknown feed")
             return
@@ -237,12 +320,14 @@ def run_pipeline(mode="KITTI", data_path=None):
 if __name__ == "__main__":
     # --- For Testing KITTI ---
     # Download a sequence and change this path to point to your data folder
+    
     kitti_sequence_directory = "./data/Kitti/flight_path_00"
     run_pipeline(mode="KITTI", data_path=kitti_sequence_directory)
     # run_pipeline(mode="TELLO")
+    # run_pipeline(mode="AUTOHAWK", drone_ip="192.168.4.1")
     
     # --- For Live Flight with the Drone ---
     # 1. Turn on Tello and connect laptop Wi-Fi to it.
     # 2. Pip install djitellopy
     # 3. Comment out the KITTI run above and uncomment the line below:
-    # run_pipeline(mode="TELLO")
+    # 4. run_pipeline(mode="TELLO")
