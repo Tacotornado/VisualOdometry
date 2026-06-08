@@ -223,4 +223,5 @@ data/data_odometry_poses
 data/data_odometry_calib
 data/Kitti
 *.zip
-
+#Drone Calibration
+data/
