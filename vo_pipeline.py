@@ -208,7 +208,7 @@ class Autohawk2ASource:
         
         return scale if scale > 0.001 else 0.0
         
-def run_pipeline(mode="KITTI", data_path=None):
+def run_pipeline(mode="KITTI", data_path=None, shared_queue=None):
     # main program code #
         if mode == "KITTI":
             print("Processing Kitti feed")
@@ -233,6 +233,13 @@ def run_pipeline(mode="KITTI", data_path=None):
         # Storage of traversed positions for plotting shit live
         traj_x, traj_z = [0], [0]
         
+        frame_counter = 0;
+        estimated_total_frames = 300
+        
+        # Dashboard progress metrics
+        if mode == "KITTI" and data_path and os.path.exists(data_path):
+            estimated_total_frames = len(os.listdir(data_path))
+        
         plt.ion()
         fig, ax = plt.subplots()
         line, = ax.plot([], [], 'ro-', label="Tracked Path")
@@ -254,6 +261,7 @@ def run_pipeline(mode="KITTI", data_path=None):
             if frame_curr is None:
                 break
             
+            frame_counter +=1
             gray_curr = cv2.cvtColor(frame_curr, cv2.COLOR_BGR2GRAY)
             scale = source.get_scale()
             
@@ -294,6 +302,21 @@ def run_pipeline(mode="KITTI", data_path=None):
                 fig.canvas.draw()
                 fig.canvas.flush_events()
                 plt.pause(0.01)
+            
+            # --- TRANSMIT TRUE TELEMETRY DATA TO THE DASHBOARD ---
+            if shared_queue is not None:
+                # Current true position relative to takeoff point
+                current_vo_pos = [float(cur_t[0, 0]), float(cur_t[1, 0]), float(cur_t[2, 0])]
+                
+                # Calculate absolute straight-line distance from the start position (0,0,0)
+                distance_from_start = float(np.linalg.norm(cur_t))
+
+                shared_queue.put({
+                    "frame_idx": frame_counter,
+                    "total_frames": estimated_total_frames,
+                    "estimated": current_vo_pos,
+                    "distance_from_start": distance_from_start
+                })
 
             # Visual Diagnostics Window
             frame_vis = frame_curr.copy()
