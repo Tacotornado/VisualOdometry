@@ -204,10 +204,19 @@ def run_pipeline(mode="KITTI", data_path=None, shared_queue=None):
         ax.legend()
         ax.grid(True)
     
-    frame_prev = source.get_frame()
-    if frame_prev is None: 
-        print("Error: could not read first frame.")
+    # --- FIX: Cycle frames until the drone camera sensor returns an actual valid picture ---
+    frame_prev = None
+    print("Waiting for stable camera feed initialization...")
+    for _ in range(30):
+        frame_prev = source.get_frame()
+        if frame_prev is not None and np.sum(frame_prev) > 0:
+            break
+        time.sleep(0.1)
+        
+    if frame_prev is None or np.sum(frame_prev) == 0: 
+        print("Error: could not read valid initial frame from source.")
         return
+        
     gray_prev = cv2.cvtColor(frame_prev, cv2.COLOR_BGR2GRAY)
     pts_prev = cv2.goodFeaturesToTrack(gray_prev, maxCorners=1000, qualityLevel=0.01, minDistance=10)
     
@@ -220,9 +229,15 @@ def run_pipeline(mode="KITTI", data_path=None, shared_queue=None):
         gray_curr = cv2.cvtColor(frame_curr, cv2.COLOR_BGR2GRAY)
         scale = source.get_scale()
         
+        # --- FIX: Guard block against empty tracking vectors before launching optical flow ---
+        if pts_prev is None or len(pts_prev) == 0:
+            pts_prev = cv2.goodFeaturesToTrack(gray_prev, maxCorners=1000, qualityLevel=0.01, minDistance=10)
+            gray_prev = gray_curr
+            continue
+        
         pts_curr, status, _ = cv2.calcOpticalFlowPyrLK(gray_prev, gray_curr, pts_prev, None)
         
-        if pts_curr is None or status is None:
+        if pts_curr is None or status is None or len(pts_curr) == 0:
             pts_curr = cv2.goodFeaturesToTrack(gray_curr, maxCorners=1000, qualityLevel=0.01, minDistance=10)
             gray_prev = gray_curr
             pts_prev = pts_curr
@@ -231,21 +246,23 @@ def run_pipeline(mode="KITTI", data_path=None, shared_queue=None):
         good_prev = pts_prev[status.ravel() == 1]
         good_curr = pts_curr[status.ravel() == 1]
         
+        # --- FIX: Only calculate essential matrix if enough keypoints survived RANSAC filtering ---
         if len(good_curr) > 10:
             E, mask = cv2.findEssentialMat(good_curr, good_prev, source.K, method=cv2.RANSAC, prob=0.99, threshold=1.0)
-            _, R, t, _ = cv2.recoverPose(E, good_curr, good_prev, source.K, mask=mask)
+            if E is not None and E.shape == (3, 3):
+                _, R, t, _ = cv2.recoverPose(E, good_curr, good_prev, source.K, mask=mask)
 
-            if scale > 0.0:
-                delta_t = scale * cur_R.dot(t)
-                cur_t[0, 0] += delta_t[0, 0]
-                cur_t[2, 0] += delta_t[2, 0]
-                
-                if mode == "TELLO" and hasattr(source, '_last_alt_delta'):
-                    cur_t[1, 0] += source._last_alt_delta
-                else:
-                    cur_t[1, 0] += delta_t[1, 0]
-                
-                cur_R = R.dot(cur_R)
+                if scale > 0.0:
+                    delta_t = scale * cur_R.dot(t)
+                    cur_t[0, 0] += delta_t[0, 0]
+                    cur_t[2, 0] += delta_t[2, 0]
+                    
+                    if mode == "TELLO" and hasattr(source, '_last_alt_delta'):
+                        cur_t[1, 0] += source._last_alt_delta
+                    else:
+                        cur_t[1, 0] += delta_t[1, 0]
+                    
+                    cur_R = R.dot(cur_R)
         
         traj_x.append(cur_t[0, 0])
         traj_z.append(cur_t[2, 0])
