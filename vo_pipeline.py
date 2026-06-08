@@ -1,248 +1,331 @@
-import os
+import tkinter as tk
+from tkinter import ttk, messagebox
+import multiprocessing  # FIXED: Swapped out threading for true process isolation
+import queue
 import time
-import cv2
+import os
 import numpy as np
+import cv2
 import matplotlib.pyplot as plt
-from djitellopy import Tello
+from mpl_toolkits.mplot3d import Axes3D  # Explicit import for 3D plotting spatial setups
 
 
-# Data source management #
+# Import your pipeline backend runner
+from vo_pipeline import run_pipeline
 
-class KittiSource:
-    def __init__(self, sequence_path):
-            # 1. Update image path to match your "images" folder
-            self.img_dir = os.path.join(sequence_path, "images")
-            self.images = sorted([os.path.join(self.img_dir, f) for f in os.listdir(self.img_dir) if f.endswith(('.png', '.jpg', '.jpeg'))])
-            self.idx = 0
-            
-            # 2. Update to match your "ground_truth.txt" file name
-            gt_path = os.path.join(sequence_path, "ground_truth.txt")
-            self.gt_poses = np.loadtxt(gt_path, dtype=float) if os.path.exists(gt_path) else None
-            
-            # 3. Parse your specific "calib.txt" dynamically if it's there, 
-            # otherwise fallback to default KITTI intrinsics
-            calib_path = os.path.join(sequence_path, "calib.txt")
-            self.K = self._load_intrinsics(calib_path)
 
-    def _load_intrinsics(self, calib_path):
-        """Attempts to parse calib.txt. If formatting differs, falls back to baseline."""
-        try:
-            if os.path.exists(calib_path):
-                with open(calib_path, 'r') as f:
-                    first_line = f.readline().strip().split()
-                # Check if it's a standard KITTI 12-element projection row
-                if len(first_line) >= 12:
-                    # If it starts with an identifier like 'P0:', drop it
-                    data = [float(x) for x in first_line[1:]] if ':' in first_line[0] else [float(x) for x in first_line]
-                    P = np.array(data[:12]).reshape(3, 4)
-                    return P[:, :3] # Return the 3x3 Intrinsic matrix K
-        except Exception as e:
-            print(f"Warning: Could not parse calib.txt ({e}). Using default KITTI matrix.")
-            
-        # Default fallback KITTI Intrinsics matrix
-        return np.array([[718.856,   0.0,   607.1928],
-                        [  0.0,   718.856, 185.2157],
-                        [  0.0,     0.0,     1.0]])
-        
-    def get_frame(self):
-        if self.idx >= len(self.images):
-            return None
-        frame = cv2.imread(self.images[self.idx])
-        self.idx += 1
-        return frame
-    
-    def get_scale(self):
-        """ this is merely to test the loop and see if it works since in the Kitti dataset we dont have any IMU data 
-        instead we will use the group truths for the true scale and use it to test the loop. obviously this defeats 
-        the purpose of odometry hence this should only be used to debugging the loop."""
-        if self.gt_poses is None or self.idx < 2:
-            return 1.0
-        
-        # data comes in a 12 number string and will be reshaped into a matrix with last col representing estimated scale
-        p1 = self.gt_poses[self.idx -2].reshape(3, 4)[:, 3]
-        p2 = self.gt_poses[self.idx -1].reshape(3, 4)[:, 3]
-        return float(np.linalg.norm(p2 - p1))
-    
-class TelloSource:
-    def __init__(self):
-        print(" Attempting to connect to Tello drone ...")
-        self.tello = Tello()
-        self.tello.connect()
-        
-        print("success: connected to drone")
-        print(f"Battery percentage at: {self.tello.get_battery()}%")
-        
-        print("Initializing camera video stream  ...")
-        self.tello.streamon()
-        time.sleep(5.0) # delay for camera
-        
-        print("Hao de!, stream is on!")
-        
-        self.frame_reader = self.tello.get_frame_read()
-        
-        # Tello instrinsics based of research from paper
-        self.K = np.array([[365.9667,   0.0,    213.3087],
-                           [  0.0,    496.2820, 225.1782],
-                           [  0.0,      0.0,      1.0]])
-        
-        self.last_time = time.time()
-        
-    def get_frame(self):
-        frame = self.frame_reader.frame
-        return frame
-    
-    def get_scale(self):
-        """Using IMU data from Tello drone to estimate the scale"""
-        dt = time.time() - self.last_time
-        self.last_time = time.time()
-        
-        try:
-            state = self.tello.get_current_state()
-            
-            vx = int(state.get('vgx', 0))
-            vy = int(state.get('vgy', 0))
-            vz = int(state.get('vgz', 0))
-        except:
-            vx, vy, vz = 0, 0, 0,
-            print("Exception: velocities not found, fallback placeholder used")
-        
-            # getting velocity in cm/s from IMU sensors
-            # vx = self.tello.get_velocity_x()
-            # vy = self.tello.get_velocity_y()
-            # vz = self.tello.get_velocity_z()
-        print(f"Velocity X: {vx} cm/s, Y: {vy} cm/s, Z: {vz} cm/s")
-        
-        # Convert cm/s to meters/frame
-        speed_mps = np.sqrt(vx**2 + vy**2 + vz**2) / 100.0
-        scale = speed_mps * dt
-        return scale if scale > 0.005 else 0.0  # Threshold micro-noise when hovering
-    
-class Autohawk2ASource:
-    def __init__(self):
-        print("Attempting to connect to Autohawk2A")
-        
-    def get_frame(self):
-        print("getting frame")
-        
-    def get_scale(self):
-        dt = time.time() - self.last_time
-        self.last_time = time.time()
-        
-def run_pipeline(mode="KITTI", data_path=None):
-    # main program code #
-        if mode == "KITTI":
-            print("Processing Kitti feed")
-            source = KittiSource(data_path)
-        elif mode == "TELLO":
-            print("Processing Tello feed")
-            source = TelloSource()
-        elif mode == "Airsim":
-            print("Processing Airsim feed")
+class VODashboardApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("AUTOHAWK // Visual Odometry Control Station")
+        self.root.geometry("450x650")
+       
+        # --- STYLING: Synthwave/Cyberpunk-inspired Palette ---
+        self.bg_color = "#120e2e"       # Deep Dark Navy/Purple
+        self.panel_color = "#1a153a"    # Lighter container purple
+        self.accent_cyan = "#00f0ff"    # Electric Cyan
+        self.accent_pink = "#ff007f"    # Hot Pink
+        self.text_color = "#ffffff"     # White
+       
+        self.root.configure(bg=self.bg_color)
+       
+        # Configure custom ttk styles for a unified theme
+        self.style = ttk.Style()
+        self.style.theme_use('default')
+        self.style.configure('.', background=self.bg_color, foreground=self.text_color)
+        self.style.configure('TFrame', background=self.bg_color)
+        self.style.configure('TLabelframe', background=self.panel_color, foreground=self.accent_cyan)
+        self.style.configure('TLabelframe.Label', background=self.panel_color, foreground=self.accent_cyan, font=('Courier', 10, 'bold'))
+       
+        # Custom look for progress bar
+        self.style.configure("Cyan.Horizontal.TProgressbar", troughcolor=self.bg_color, background=self.accent_cyan, thickness=15)
+
+
+        # --- STATE MANAGEMENT ---
+        self.vo_process = None  # FIXED: Changed from thread to process
+        self.running = False
+        self.data_queue = None  # Instantiated at runtime using multiprocessing.Queue()
+        self.start_time = 0
+       
+        # Purely tracking the actual calculated real positions
+        self.estimated_vo_history = []
+       
+        self.setup_ui_layout()
+       
+    def setup_ui_layout(self):
+        """Builds out the control interface widgets"""
+       
+        # 1. Header Banner
+        header = tk.Label(self.root, text="AUTOHAWK VO CORE", font=("Courier", 18, "bold"), bg=self.bg_color, fg=self.accent_pink)
+        header.pack(pady=15)
+       
+        # 2. Pipeline Data Source Selector Panel
+        source_frame = ttk.LabelFrame(self.root, text=" 1. CHOOSE DATA STREAM ")
+        source_frame.pack(fill="x", padx=20, pady=10)
+       
+        tk.Label(source_frame, text="Active Mode:", bg=self.panel_color, fg=self.text_color).grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        self.mode_var = tk.StringVar(value="KITTI")
+        self.mode_combo = ttk.Combobox(source_frame, textvariable=self.mode_var, values=["KITTI", "TELLO", "AUTOHAWK2A"], state="readonly", width=15)
+        self.mode_combo.grid(row=0, column=1, padx=10, pady=10)
+       
+        # 3. Hyperparameter Configuration Entry Fields
+        param_frame = ttk.LabelFrame(self.root, text=" 2. TUNING HYPERPARAMETERS ")
+        param_frame.pack(fill="x", padx=20, pady=10)
+       
+        self.param_fields = {
+            "max_features": ("Max Target Features:", "500"),
+            "window_size": ("LK Window Size:", "15"),
+            "pyramid_level": ("Pyramid Levels:", "3"),
+            "ransac_thresh": ("RANSAC Threshold:", "1.0")
+        }
+        self.entries = {}
+       
+        for idx, (key, (label_text, default_val)) in enumerate(self.param_fields.items()):
+            tk.Label(param_frame, text=label_text, bg=self.panel_color, fg=self.text_color).grid(row=idx, column=0, padx=10, pady=5, sticky="w")
+            entry = tk.Entry(param_frame, bg=self.bg_color, fg=self.accent_cyan, insertbackground=self.accent_cyan, borderwidth=1, relief="solid", width=12)
+            entry.insert(0, default_val)
+            entry.grid(row=idx, column=1, padx=10, pady=5, sticky="e")
+            self.entries[key] = entry
+           
+        # 4. Diagnostics & Live Engine Metrics Reading Panel
+        metrics_frame = ttk.LabelFrame(self.root, text=" 3. CORE TELEMETRY ")
+        metrics_frame.pack(fill="x", padx=20, pady=10)
+       
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(metrics_frame, length=200, mode='determinate', variable=self.progress_var, style="Cyan.Horizontal.TProgressbar")
+        self.progress_bar.grid(row=0, column=0, columnspan=2, padx=15, pady=10, sticky="ew")
+        metrics_frame.columnconfigure(0, weight=1)
+       
+        self.lbl_status = tk.Label(metrics_frame, text="Engine Status: STANDBY", bg=self.panel_color, fg=self.text_color, font=("Courier", 10))
+        self.lbl_status.grid(row=1, column=0, columnspan=2, pady=2, sticky="w", padx=10)
+
+
+        self.lbl_distance = tk.Label(metrics_frame, text="Distance from Start: 0.00 m", bg=self.panel_color, fg=self.accent_pink, font=("Courier", 10, "bold"))
+        self.lbl_distance.grid(row=2, column=0, columnspan=2, pady=2, sticky="w", padx=10)
+       
+        self.lbl_fps = tk.Label(metrics_frame, text="Processing Speed: 0.0 FPS", bg=self.panel_color, fg=self.accent_cyan, font=("Courier", 10))
+        self.lbl_fps.grid(row=3, column=0, columnspan=2, pady=2, sticky="w", padx=10)
+
+
+        # 5. Pipeline Primary Control Action Switches
+        btn_frame = ttk.Frame(self.root)
+        btn_frame.pack(pady=20)
+       
+        self.btn_start = tk.Button(btn_frame, text="LAUNCH VO", font=("Courier", 11, "bold"), bg="#052e16", fg=self.accent_cyan, activebackground=self.accent_cyan, command=self.start_vo_engine, width=14, relief="flat")
+        self.btn_start.grid(row=0, column=0, padx=10)
+       
+        self.btn_stop = tk.Button(btn_frame, text="HALT CORE", font=("Courier", 11, "bold"), bg="#450a0a", fg=self.accent_pink, state=tk.DISABLED, command=self.stop_vo_engine, width=14, relief="flat")
+        self.btn_stop.grid(row=0, column=1, padx=10)
+
+
+    # --- CONTROLLER METHODS ---
+   
+    def start_vo_engine(self):
+        """Instantiates tracking queues and fires up the background pipeline process"""
+        self.running = True
+        self.start_time = time.time()
+        self.estimated_vo_history.clear()
+       
+        # FIXED: Use a Multiprocessing Queue to bridge separate core memories safely
+        self.data_queue = multiprocessing.Queue()
+       
+        config = {
+            "mode": self.mode_var.get(),
+            "max_features": int(self.entries["max_features"].get()),
+            "window_size": int(self.entries["window_size"].get()),
+            "pyramid_level": int(self.entries["pyramid_level"].get()),
+            "ransac_thresh": float(self.entries["ransac_thresh"].get())
+        }
+       
+        self.btn_start.config(state=tk.DISABLED)
+        self.btn_stop.config(state=tk.NORMAL)
+        self.lbl_status.config(text="Engine Status: RUNNING...", fg=self.accent_cyan)
+       
+        # FIXED: Launch true Process instead of Thread to prevent GUI freezing
+        self.vo_process = multiprocessing.Process(
+            target=worker_process_wrapper,
+            args=(config, self.data_queue)
+        )
+        self.vo_process.start()
+       
+        # Begin checking the communication queue loop inside the main interface frame
+        self.root.after(50, self.poll_queue_updates)
+
+
+    def poll_queue_updates(self):
+        """Drains data items from the worker process to safely redraw widgets"""
+        if self.data_queue is None:
             return
+
+
+        packet = None
+        try:
+            # Drain queue completely to parse the newest incoming packet data frame
+            while True:
+                packet = self.data_queue.get_nowait()
+                if packet and "estimated" in packet:
+                    self.estimated_vo_history.append(packet["estimated"])
+        except queue.Empty:
+            pass  # Queue caught up entirely for this tick cycle
+           
+        # If we received data this loop cycle, paint it straight onto UI widgets
+        if packet is not None:
+            frame_idx = packet.get("frame_idx", 0)
+            total_frames = packet.get("total_frames", 100)
+           
+            pct = (frame_idx / total_frames) * 100 if total_frames > 0 else 0
+            self.progress_var.set(pct)
+           
+            if "distance_from_start" in packet:
+                self.lbl_distance.config(text=f"Distance from Start: {packet['distance_from_start']:.2f} m")
+           
+            elapsed = time.time() - self.start_time
+            fps = frame_idx / elapsed if elapsed > 0 else 0
+            self.lbl_fps.config(text=f"Processing Speed: {fps:.1f} Frames/sec")
+            self.lbl_status.config(text=f"Engine Status: Frame {frame_idx}/{total_frames}")
+           
+        # FIXED: Track process life dynamically rather than relying on shared booleans
+        process_alive = self.vo_process and self.vo_process.is_alive()
+
+
+        if not process_alive and self.data_queue.empty():
+            self.running = False
+            self.wrap_up_pipeline()
+            return
+           
+        # Reschedule check loop to execute again in 50 milliseconds
+        if self.running or process_alive:
+            self.root.after(50, self.poll_queue_updates)
+
+
+    def stop_vo_engine(self):
+        """Forces immediate runtime termination signals to the background process"""
+        self.running = False
+        if self.vo_process and self.vo_process.is_alive():
+            self.vo_process.terminate()  # FIXED: Hard-kills the frozen pipeline process instantly
+            self.vo_process.join()
+       
+        self.lbl_status.config(text="Engine Status: ABORTED", fg=self.accent_pink)
+        self.wrap_up_pipeline()
+
+
+    def wrap_up_pipeline(self):
+        """Restores system control triggers and prints out performance figures"""
+        if self.btn_start['state'] == tk.NORMAL:
+            return  # Core has already wrapped up, abort duplicate call!
+
+
+        self.btn_start.config(state=tk.NORMAL)
+        self.btn_stop.config(state=tk.DISABLED)
+       
+        if len(self.estimated_vo_history) > 2:
+            self.lbl_status.config(text="Engine Status: SUCCESS", fg="#22c55e")
+            self.root.after(100, self.generate_trajectory_plot)
         else:
-            print("unknown feed")
+            self.lbl_status.config(text="Engine Status: STANDBY", fg=self.text_color)
+
+
+    # --- TRUE 3D SPATIAL PATH PLOTTING ---
+
+
+    def generate_trajectory_plot(self):
+        """Generates an intuitive, depth-cued 3D spatial plot of the flight path"""
+        est = np.array(self.estimated_vo_history)
+       
+        if est.ndim < 2 or len(est) < 2:
+            messagebox.showinfo("Data Saved", "Flight tracking complete. Path data empty.")
             return
-        
-        # Trajectory State matrix setups
-        cur_R = np.eye(3)
-        cur_t = np.zeros((3, 1))
-        
-        # Storage of traversed positions for plotting shit live
-        traj_x, traj_z = [0], [0]
-        
-        plt.ion()
-        fig, ax = plt.subplots()
-        line, = ax.plot([], [], 'ro-', label="Tracked Path")
-        ax.legend()
-        ax.grid(True)
-        
-        # Processing frame 0
-        frame_prev = source.get_frame()
-        if frame_prev is None: 
-            print("Error: could not read first frame.")
-            return
-        gray_prev = cv2.cvtColor(frame_prev, cv2.COLOR_BGR2GRAY)
-        
-        # initial feature detection
-        pts_prev = cv2.goodFeaturesToTrack(gray_prev, maxCorners=1000, qualityLevel=0.01, minDistance=10)
-        
-        while True:
-            frame_curr = source.get_frame()
-            if frame_curr is None:
-                break
-            
-            gray_curr = cv2.cvtColor(frame_curr, cv2.COLOR_BGR2GRAY)
-            scale = source.get_scale()
-            
-            # feature tracking part with optical flow
-            pts_curr, status, _ = cv2.calcOpticalFlowPyrLK(gray_prev, gray_curr, pts_prev, None)
-            
-            # redetect features if lost optical flow
-            if pts_curr is None or status is None:
-                pts_curr = cv2.goodFeaturesToTrack(gray_curr, maxCorners=1000, qualityLevel=0.01, minDistance=10)
-                gray_prev = gray_curr
-                pts_prev = pts_curr
-                continue
-            
-            # good_prev =  pts_prev[status[:, 0] == 1]
-            # good_curr =  pts_curr[status[:, 0] == 1]
-            
-            good_prev = pts_prev[status.ravel() == 1]
-            good_curr = pts_curr[status.ravel() == 1]
-            
-            if len(good_curr) > 10:
-                # Estimate Essential Matrix and Essential Motion
-                E, mask = cv2.findEssentialMat(good_curr, good_prev, source.K, method=cv2.RANSAC, prob=0.99, threshold=1.0)
-                _, R, t, _ = cv2.recoverPose(E, good_curr, good_prev, source.K, mask=mask)
+        i = 0
+        comb = [(0,1,2),(0,2,1),(1,0,2),(1,2,0),(2,1,0),(2,0,1)]
+        #change the x y and z axis and display the results
+        while i < 6:
+            # Extract standard drone reference positions
+            # x = Lateral (Left/Right), y = Altitude (Up/Down), z = Depth (Forward/Backward)
+            x,y,z = comb[i]
+            x_coords = est[:, x]
+            y_coords = est[:, z]
+            z_coords = est[:, y]
 
-                # Accumulate pose if the drone actually moved
-                if scale > 0.0:
-                    cur_t = cur_t + scale * cur_R.dot(t)
-                    cur_R = R.dot(cur_R)
 
-                # Update live plotting lists (mapping 3D coordinates to a 2D floor plan)
-                traj_x.append(cur_t[0, 0])
-                traj_z.append(cur_t[2, 0])
-                
-                # Dynamic map scaling
-                line.set_data(traj_x, traj_z)
-                ax.relim()
-                ax.autoscale_view()
-                fig.canvas.draw()
-                fig.canvas.flush_events()
-                plt.pause(0.01)
+            # Create the figure with a dark cyberpunk-friendly aesthetic
+            plt.style.use('dark_background')
+            fig = plt.figure(figsize=(10, 8))
+            ax = fig.add_subplot(111, projection='3d')
+            fig.suptitle(f"AUTOHAWK // VISUAL ODOMETRY FLIGHT PATH {x}, {y}, {z}", fontsize=12, fontweight='bold', color="#00f0ff")
+           
+            # --- VISUAL UPGRADE 1: Color-Coded Progress Gradient ---
+            # Maps the trajectory line over time from electric cyan to hot pink
+            num_points = len(est)
+            colors = plt.cm.cool(np.linspace(0, 1, num_points))
+           
+            for i in range(num_points - 1):
+                ax.plot(x_coords[i:i+2], z_coords[i:i+2], y_coords[i:i+2],
+                        color=colors[i], linewidth=2.5, alpha=0.9)
 
-            # Visual Diagnostics Window
-            frame_vis = frame_curr.copy()
-            for pt in good_curr:
-                x, y = pt.ravel()
-                cv2.circle(frame_curr, (int(x), int(y)), 3, (0, 255, 0), -1)
-            cv2.imshow("VO Camera Feed", frame_curr)
-            
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
 
-            # Refresh tracking points if they drop too low
-            if len(good_curr) < 200:
-                pts_curr = cv2.goodFeaturesToTrack(gray_curr, maxCorners=1000, qualityLevel=0.01, minDistance=10)
-                
-            gray_prev = gray_curr
-            pts_prev = pts_curr
+            # --- VISUAL UPGRADE 2: Floor Drop-Shadow Projection ---
+            # Spits a gray/faded trace on the ground plane to give an instant depth cue
+            floor_level = np.min(y_coords) - 1.0  # Set floor slightly below the lowest altitude point
+            ax.plot(x_coords, z_coords, zs=floor_level, zdir='z',
+                    color="#3a2f6b", linestyle="--", linewidth=1.5, alpha=0.6, label="Ground Projection Track")
 
-        cv2.destroyAllWindows()
-        plt.ioff()
-        plt.show()
-            
-            
+
+            # Mark key operational milestones explicitly
+            ax.scatter(x_coords[0], z_coords[0], y_coords[0], color="#22c55e", s=120, edgecolors='w', label="Takeoff Pad (Origin)")
+            ax.scatter(x_coords[-1], z_coords[-1], y_coords[-1], color="#ff007f", s=120, edgecolors='w', label="Current Drone Position")
+           
+            # Add subtle dotted projection lines connecting the current position straight to the floor
+            ax.plot([x_coords[-1], x_coords[-1]], [z_coords[-1], z_coords[-1]], [floor_level, y_coords[-1]],
+                    color="#ff007f", linestyle=":", linewidth=1.5)
+
+
+            # Labels and Spatial Dynamics
+            ax.set_xlabel("X - Lateral (meters)", labelpad=10, color="#ffffff")
+            ax.set_ylabel("Z - Depth (meters)", labelpad=10, color="#ffffff")
+            ax.set_zlabel("Y - Altitude (meters)", labelpad=10, color="#ffffff")
+           
+            # --- VISUAL UPGRADE 3: Set Equal Axis Scaling ---
+            # Prevents Matplotlib from warping stretching physical proportions distortedly
+            max_range = np.array([x_coords.max()-x_coords.min(), z_coords.max()-z_coords.min(), y_coords.max()-y_coords.min()]).max() / 2.0
+            mid_x = (x_coords.max()+x_coords.min()) * 0.5
+            mid_y = (y_coords.max()+y_coords.min()) * 0.5
+            mid_z = (z_coords.max()+z_coords.min()) * 0.5
+            ax.set_xlim(mid_x - max_range, mid_x + max_range)
+            ax.set_ylim(mid_z - max_range, mid_z + max_range)
+            ax.set_zlim(mid_y - max_range, mid_y + max_range)
+
+
+            # Clean background pane colors to match the dashboard aesthetic
+            ax.xaxis.set_pane_color((0.07, 0.05, 0.18, 1.0))
+            ax.yaxis.set_pane_color((0.07, 0.05, 0.18, 1.0))
+            ax.zaxis.set_pane_color((0.10, 0.08, 0.23, 1.0))
+           
+            ax.grid(True, linestyle=":", alpha=0.3, color="#00f0ff")
+            ax.legend(loc="upper left")
+           
+            plt.tight_layout()
+            plt.savefig(f"VISUAL ODOMETRY FLIGHT PATH {x}, {y}, {z}.png",dpi=300)
+            plt.show()
+
+
+            i=i+1
+
+
+# FIXED: Standard standalone function outside of class space to allow multiprocessing serialization
+def worker_process_wrapper(config, data_q):
+    """Isolated process code executed entirely separate from Tkinter UI thread"""
+    try:
+        kitti_path = "./data/Kitti/flight_path_00" if config["mode"] == "KITTI" else None
+        run_pipeline(mode=config["mode"], data_path=kitti_path, shared_queue=data_q)
+    except Exception as e:
+        print(f"Engine Process Crash: {e}")
+
+
 if __name__ == "__main__":
-    # --- For Testing KITTI ---
-    # Download a sequence and change this path to point to your data folder
-    # kitti_sequence_directory = "./data/Kitti/flight_path_00"
-    # run_pipeline(mode="KITTI", data_path=kitti_sequence_directory)
-    run_pipeline(mode="TELLO")
-    
-    # --- For Live Flight with the Drone ---
-    # 1. Turn on Tello and connect laptop Wi-Fi to it.
-    # 2. Pip install djitellopy
-    # 3. Comment out the KITTI run above and uncomment the line below:
-    # run_pipeline(mode="TELLO")
+    # CRITICAL: Fixes multiprocessing instantiation context rules across Windows/macOS platforms
+    multiprocessing.freeze_support()
+   
+    root = tk.Tk()
+    app = VODashboardApp(root)
+    root.mainloop()
+
