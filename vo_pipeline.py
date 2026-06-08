@@ -237,9 +237,9 @@ def run_pipeline(mode="KITTI", data_path=None):
 if __name__ == "__main__":
     # --- For Testing KITTI ---
     # Download a sequence and change this path to point to your data folder
-    kitti_sequence_directory = "./data/Kitti/flight_path_00"
-    run_pipeline(mode="KITTI", data_path=kitti_sequence_directory)
-    # run_pipeline(mode="TELLO")
+    # kitti_sequence_directory = "./data/Kitti/flight_path_00"
+    # run_pipeline(mode="KITTI", data_path=kitti_sequence_directory)
+    run_pipeline(mode="TELLO")
     
     # --- For Live Flight with the Drone ---
     # 1. Turn on Tello and connect laptop Wi-Fi to it.

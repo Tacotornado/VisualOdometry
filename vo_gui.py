@@ -10,7 +10,7 @@ import numpy as np
 
 # Optional pipeline dependencies
 try:
-    import visual_odometry
+    import vo_pipeline
     VO_AVAILABLE = True
 except ImportError:
     VO_AVAILABLE = False
@@ -40,9 +40,9 @@ F_VALUE     = ("Consolas", 10, "bold")
 F_MONO      = ("Consolas", 8)
 F_BTN       = ("Consolas", 10, "bold")
 
-#---------------------------------------------------------------------------
+
 # Main Application Block
-#---------------------------------------------------------------------------
+
 class VOApp:
 
     def __init__(self, root: tk.Tk):
@@ -64,9 +64,9 @@ class VOApp:
 
         self.Init_UI()
 
-    #---------------------------------------------------------------------------
+    
     # UI Core Builder Routines
-    #---------------------------------------------------------------------------
+    
     def Init_UI(self):
         # Top branding header bar
         bar = tk.Frame(self.root, bg=C_ACCENT, height=44)
@@ -111,9 +111,9 @@ class VOApp:
                  anchor="w", padx=10, pady=4
                  ).pack(fill="x", side="bottom")
 
-    #---------------------------------------------------------------------------
+    
     # Panel Modules
-    #---------------------------------------------------------------------------
+    
     def Build_Source_Panel(self, parent):
         frame = self.Create_Card(parent, "◈  DATA SOURCE")
 
@@ -286,9 +286,9 @@ class VOApp:
             tk.Label(row, text=unit, font=F_MONO, fg=C_SUBTEXT,
                      bg=C_PANEL).pack(side="left")
 
-    #---------------------------------------------------------------------------
+    
     # Event State Handlers
-    #---------------------------------------------------------------------------
+   
     def On_Source_Change(self):
         mode = self.source_mode.get()
         self._kitti_frame.pack_forget()
@@ -306,9 +306,9 @@ class VOApp:
         if p:
             self.kitti_path.set(p)
 
-    #---------------------------------------------------------------------------
+    
     # Parameter Helpers
-    #---------------------------------------------------------------------------
+    
     def Read_Params(self) -> dict | None:
         """Read and validate all VO parameter fields. Returns None on error."""
         try:
@@ -336,9 +336,9 @@ class VOApp:
             self._param_entries[key].delete(0, tk.END)
             self._param_entries[key].insert(0, val)
 
-    #---------------------------------------------------------------------------
+    
     # Pipeline Controls
-    #---------------------------------------------------------------------------
+   
     def Start_Pipeline(self):
         if self.running:
             return
@@ -409,9 +409,9 @@ class VOApp:
             self.Set_Buttons("running")
             self.Update_Status("Pipeline resumed.")
 
-    #---------------------------------------------------------------------------
+    
     # Background Thread & Queue
-    #---------------------------------------------------------------------------
+    
     def Run_VO_Thread(self, q: queue.Queue, params: dict, mode: str):
         """Runs the VO pipeline in a background thread (daemon)."""
         if not VO_AVAILABLE:
@@ -427,25 +427,39 @@ class VOApp:
                 q.put((i, total, (i + 1) / elapsed))
             self.running = False
             return
-
-        # Real pipeline call — passes all validated params and the detector choice
-        ground_truth = []
-        monocular_vo = []
-        visual_odometry.main(
-            q,
-            self.folder_path,
-            ground_truth,
-            monocular_vo,
-            params["n_features"],
-            params["win_size"],
-            params["pyr_levels"],
-            params["n_iter"],
-            params["inlier_thresh"],
-            detector=self.detector_var.get(),
+        
+        vo_pipeline.run_pipeline(
             mode=mode,
+            data_path=self.folder_path,
+            n_features=params["n_features"],
+            win_size=params["win_size"],
+            pyr_levels=params["pyr_levels"],
+            n_iter=params["n_iter"],
+            inlier_thresh=params["inlier_thresh"],
+            detector=self.detector_var.get(),
+            q=q
         )
         cv2.destroyAllWindows()
         self.running = False
+
+        # Real pipeline call — passes all validated params and the detector choice
+       # ground_truth = []
+        #monocular_vo = []
+       # visual_odometry.main(
+           # q,
+           # self.folder_path,
+          #  ground_truth,
+           # monocular_vo,
+           # params["n_features"],
+           # params["win_size"],
+           # params["pyr_levels"],
+           # params["n_iter"],
+           # params["inlier_thresh"],
+           # detector=self.detector_var.get(),
+           # mode=mode,
+       # )
+       # cv2.destroyAllWindows()
+       # self.running = False
 
     def Poll_Queue(self, q: queue.Queue):
         """Non-blocking queue drain using tk.after() — keeps the GUI responsive."""
@@ -470,9 +484,9 @@ class VOApp:
         self.Set_Buttons("idle")
         self.Update_Status("Pipeline finished — results shown in plot window(s).")
 
-    #---------------------------------------------------------------------------
+    
     # Progress Display
-    #---------------------------------------------------------------------------
+    
     def Update_Progress(self, frame_idx: int, total: int, fps: float):
         self._stat_frame  .set(f"{frame_idx + 1} / {total}")
         self._stat_fps    .set(f"{fps:.1f}")
@@ -484,9 +498,9 @@ class VOApp:
         self._stat_fps    .set("-")
         self._stat_elapsed.set("-")
 
-    #---------------------------------------------------------------------------
+    
     # Telemetry Poll
-    #---------------------------------------------------------------------------
+    
     def Poll_Telemetry(self):
         if not self.running or self.source_mode.get() != "TELLO":
             return
@@ -504,9 +518,9 @@ class VOApp:
             pass
         self.root.after(500, self.Poll_Telemetry)
 
-    #---------------------------------------------------------------------------
+    
     # Core Infrastructure Helpers
-    #---------------------------------------------------------------------------
+    
     def Update_Status(self, msg: str):
         self.status_var.set(msg)
 
@@ -531,9 +545,9 @@ class VOApp:
         f.pack(fill="x", pady=6)
         return f
 
-#---------------------------------------------------------------------------
+
 # System Entrypoint Execution
-#---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     app_root = tk.Tk()
     app = VOApp(app_root)
