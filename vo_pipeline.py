@@ -77,9 +77,13 @@ class TelloSource:
         print("Hao de!, stream is on!")
         self.frame_reader = self.tello.get_frame_read()
         
-        self.K = np.array([[365.9667,   0.0,    213.3087],
-                           [  0.0,    496.2820, 225.1782],
-                           [  0.0,      0.0,      1.0]])
+        # self.K = np.array([[365.9667,   0.0,    213.3087],
+        #                    [  0.0,    496.2820, 225.1782],
+        #                    [  0.0,      0.0,      1.0]])
+        
+        self.K = np.array([[929.79642875, 0.0,            467.97552327],
+                           [0.0,          936.04669222,   362.39887663],
+                           [0.0,          0.0,            1.0         ]])
         self.last_time = time.time()
         
     def get_frame(self):
