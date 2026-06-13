@@ -1,5 +1,7 @@
 import os
 import time
+import threading
+import queue
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,6 +9,45 @@ import socket
 import urllib.request
 from djitellopy import Tello
 
+
+# --- Threading frame buffer to decouple live camera feeds from VO math --- #
+
+class ThreadFrameBuffer:
+    def __init__(self, source, maxsize=32):
+        self._source = source
+        self._queue = queue.Queue(maxsize=maxsize)
+        self._running = False
+        self._thread = None
+        
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+        
+    def _reader(self):
+        while self._running:
+            frame = self._source.get_frame()
+            if frame is None:
+                time.sleep(0.005)
+                continue
+            
+            # For live hardware, drop the oldest frame if full to stay real-time
+            if self._queue.full():
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self._queue.put(frame)
+            
+    def get_frame(self, timeout=0.5):
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        
+    def stop(self):
+        self._running = False
+        
 
 # --- Data Source Management ---
 
@@ -62,7 +103,6 @@ class TelloSource:
         print("success: connected to drone")
         print(f"Battery percentage at: {self.tello.get_battery()}%")
         
-        # --- OPTIMIZATION 1: Throttle video encoder stream profiles to eliminate network lag ---
         try:
             self.tello.set_video_bitrate(Tello.VIDEO_BITRATE_1Mbps)
             self.tello.set_video_fps(Tello.VIDEO_FPS_15)
@@ -76,10 +116,6 @@ class TelloSource:
         
         print("Hao de!, stream is on!")
         self.frame_reader = self.tello.get_frame_read()
-        
-        # self.K = np.array([[365.9667,   0.0,    213.3087],
-        #                    [  0.0,    496.2820, 225.1782],
-        #                    [  0.0,      0.0,      1.0]])
         
         self.K = np.array([[929.79642875, 0.0,            467.97552327],
                            [0.0,          936.04669222,   362.39887663],
@@ -178,153 +214,180 @@ class Autohawk2ASource:
         speed_mps = np.sqrt(vx**2 + vy**2 + vz**2)
         scale = speed_mps * dt
         return scale if scale > 0.001 else 0.0
+    
+
+# --- Unified Processing Engine Loop --- 
+
+def _vo_worker(frame_buffer, source, mode, shared_queue, show_local_plots, estimated_total_frames):
+    cur_R    = np.eye(3)
+    cur_t    = np.zeros((3, 1))
+    smooth_t = np.zeros((3, 1))
+    alpha    = 0.25
+ 
+    traj_x, traj_z = [0.0], [0.0]
+    frame_counter  = 0
+ 
+    if show_local_plots:
+        plt.ion()
+        fig, ax = plt.subplots()
+        line, = ax.plot([], [], 'ro-', label="Tracked Path")
+        ax.legend(); ax.grid(True)
+ 
+    # FIX: Fetch initial frame straight from file array when in KITTI mode
+    # --- Warm-up: grab a valid initial frame based on data stream mode ---
+    print("Initializing tracking context vectors...")
+    frame_prev = None
+    
+    if mode == "KITTI":
+        frame_prev = source.get_frame()
+    else:
+        # Live streams need a few moments to spin up and flush empty frames
+        print("Waiting for live camera stream to stabilize...")
+        for _ in range(60):  # Give it up to 6 seconds max
+            frame_prev = frame_buffer.get_frame(timeout=0.2)
+            if frame_prev is not None and np.sum(frame_prev) > 0:
+                print("Stable live camera stream caught successfully!")
+                break
+            time.sleep(0.1)
+ 
+    if frame_prev is None or np.sum(frame_prev) == 0:
+        print("Error: Could not capture a valid initial image element.")
+        return
+ 
+    gray_prev = cv2.cvtColor(frame_prev, cv2.COLOR_BGR2GRAY)
+    pts_prev  = cv2.goodFeaturesToTrack(gray_prev, maxCorners=1000, qualityLevel=0.01, minDistance=10)
+ 
+    while True:
+        # FIX: Pull frames sequentially from directory list for offline verification loops
+        if mode == "KITTI":
+            frame_curr = source.get_frame()
+        else:
+            frame_curr = frame_buffer.get_frame(timeout=1.0)
+            
+        if frame_curr is None:
+            break
+ 
+        frame_counter += 1
+        gray_curr = cv2.cvtColor(frame_curr, cv2.COLOR_BGR2GRAY)
+        scale     = source.get_scale()
+ 
+        if pts_prev is None or len(pts_prev) == 0:
+            pts_prev = cv2.goodFeaturesToTrack(gray_prev, maxCorners=1000, qualityLevel=0.01, minDistance=10)
+            gray_prev = gray_curr
+            continue
+ 
+        pts_curr, status, _ = cv2.calcOpticalFlowPyrLK(gray_prev, gray_curr, pts_prev, None)
+ 
+        if pts_curr is None or status is None or len(pts_curr) == 0:
+            pts_curr = cv2.goodFeaturesToTrack(gray_curr, maxCorners=1000, qualityLevel=0.01, minDistance=10)
+            gray_prev = gray_curr
+            pts_prev  = pts_curr
+            continue
+ 
+        good_prev = pts_prev[status.ravel() == 1]
+        good_curr = pts_curr[status.ravel() == 1]
+ 
+        if len(good_curr) > 10:
+            E, mask = cv2.findEssentialMat(good_curr, good_prev, source.K, method=cv2.RANSAC, prob=0.99, threshold=1.0)
+            if E is not None and E.shape == (3, 3):
+                _, R, t, _ = cv2.recoverPose(E, good_curr, good_prev, source.K, mask=mask)
+                if scale > 0.0:
+                    delta_t       = scale * cur_R.dot(t)
+                    cur_t[0, 0]  += delta_t[0, 0]
+                    cur_t[2, 0]  += delta_t[2, 0]
+                    if mode == "TELLO" and hasattr(source, '_last_alt_delta'):
+                        cur_t[1, 0] += source._last_alt_delta
+                    else:
+                        cur_t[1, 0] += delta_t[1, 0]
+                    cur_R = R.dot(cur_R)
+ 
+        smooth_t = alpha * cur_t + (1.0 - alpha) * smooth_t
+        traj_x.append(smooth_t[0, 0])
+        traj_z.append(smooth_t[2, 0])
+ 
+        frame_vis = frame_curr.copy()
+        for pt in good_curr:
+            x, y = pt.ravel()
+            cv2.circle(frame_vis, (int(x), int(y)), 3, (0, 255, 0), -1)
+ 
+        if show_local_plots:
+            line.set_data(traj_x, traj_z)
+            ax.relim(); ax.autoscale_view()
+            fig.canvas.draw_idle()
+            fig.canvas.start_event_loop(0.001)
+            cv2.imshow("VO Camera Feed", frame_vis)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+ 
+        if shared_queue is not None:
+            real_x = float(smooth_t[0, 0])
+            real_y = -float(smooth_t[1, 0])
+            real_z = float(smooth_t[2, 0])
+ 
+            # Never throttle frames when running local benchmark folders
+            jpeg_bytes = None
+            if mode == "KITTI" or shared_queue.qsize() < 3:
+                _, enc = cv2.imencode('.jpg', frame_vis, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                jpeg_bytes = enc.tobytes()
+ 
+            try:
+                shared_queue.put({
+                    "frame_idx":          frame_counter,
+                    "total_frames":       estimated_total_frames,
+                    "estimated":          [real_x, real_y, real_z],
+                    "distance_from_start": float(np.linalg.norm(smooth_t)),
+                    "video_frame":        jpeg_bytes,
+                }, timeout=0.2)
+            except queue.Full:
+                pass
+ 
+        if len(good_curr) < 200:
+            pts_curr = cv2.goodFeaturesToTrack(gray_curr, maxCorners=1000, qualityLevel=0.01, minDistance=10)
+ 
+        gray_prev = gray_curr
+        pts_prev  = pts_curr
+ 
+    if show_local_plots:
+        cv2.destroyAllWindows()
+        plt.ioff()
+        plt.show()
 
 
-# --- Main Odometry Pipeline ---
+# --- Main Pipeline Initializer ---
 
 def run_pipeline(mode="KITTI", data_path=None, shared_queue=None):
     if mode == "KITTI":
-        print("Processing Kitti feed")
+        print("Processing KITTI feed")
         source = KittiSource(data_path)
     elif mode == "TELLO":
         print("Processing Tello feed")
         source = TelloSource()
     elif mode == "AUTOHAWK2A":
         print("Processing Autohawk2A feed")
-        source = Autohawk2ASource(drone_ip="192.168.4.1", video_port=80, cmd_port=8081)
+        source = Autohawk2ASource()
     else:
-        print("unknown feed")
+        print(f"Unknown mode: {mode}")
         return
-    
-    cur_R = np.eye(3)
-    cur_t = np.zeros((3, 1))
-    
-    # --- OPTIMIZATION 2: Telemetry State Filtering Variables ---
-    smooth_t = np.zeros((3, 1))
-    alpha = 0.25  # Exponential Moving Average smoothing multiplier (Low-pass filter coefficient)
-    
-    traj_x, traj_z = [0], [0]
-    
-    frame_counter = 0
+ 
     estimated_total_frames = 300
-    
     if mode == "KITTI" and data_path and os.path.exists(data_path):
-        estimated_total_frames = len(os.listdir(data_path))
-    
+        img_dir = os.path.join(data_path, "images")
+        if os.path.isdir(img_dir):
+            estimated_total_frames = len(os.listdir(img_dir))
+ 
     show_local_plots = (shared_queue is None)
-    
-    if show_local_plots:
-        plt.ion()
-        fig, ax = plt.subplots()
-        line, = ax.plot([], [], 'ro-', label="Tracked Path")
-        ax.legend()
-        ax.grid(True)
-    
-    frame_prev = None
-    print("Waiting for stable camera feed initialization...")
-    for _ in range(30):
-        frame_prev = source.get_frame()
-        if frame_prev is not None and np.sum(frame_prev) > 0:
-            break
-        time.sleep(0.1)
-        
-    if frame_prev is None or np.sum(frame_prev) == 0: 
-        print("Error: could not read valid initial frame from source.")
-        return
-        
-    gray_prev = cv2.cvtColor(frame_prev, cv2.COLOR_BGR2GRAY)
-    pts_prev = cv2.goodFeaturesToTrack(gray_prev, maxCorners=1000, qualityLevel=0.01, minDistance=10)
-    
-    while True:
-        frame_curr = source.get_frame()
-        if frame_curr is None:
-            break
-        
-        frame_counter += 1
-        gray_curr = cv2.cvtColor(frame_curr, cv2.COLOR_BGR2GRAY)
-        scale = source.get_scale()
-        
-        if pts_prev is None or len(pts_prev) == 0:
-            pts_prev = cv2.goodFeaturesToTrack(gray_prev, maxCorners=1000, qualityLevel=0.01, minDistance=10)
-            gray_prev = gray_curr
-            continue
-        
-        pts_curr, status, _ = cv2.calcOpticalFlowPyrLK(gray_prev, gray_curr, pts_prev, None)
-        
-        if pts_curr is None or status is None or len(pts_curr) == 0:
-            pts_curr = cv2.goodFeaturesToTrack(gray_curr, maxCorners=1000, qualityLevel=0.01, minDistance=10)
-            gray_prev = gray_curr
-            pts_prev = pts_curr
-            continue
-        
-        good_prev = pts_prev[status.ravel() == 1]
-        good_curr = pts_curr[status.ravel() == 1]
-        
-        if len(good_curr) > 10:
-            E, mask = cv2.findEssentialMat(good_curr, good_prev, source.K, method=cv2.RANSAC, prob=0.99, threshold=1.0)
-            if E is not None and E.shape == (3, 3):
-                _, R, t, _ = cv2.recoverPose(E, good_curr, good_prev, source.K, mask=mask)
-
-                if scale > 0.0:
-                    delta_t = scale * cur_R.dot(t)
-                    cur_t[0, 0] += delta_t[0, 0]
-                    cur_t[2, 0] += delta_t[2, 0]
-                    
-                    if mode == "TELLO" and hasattr(source, '_last_alt_delta'):
-                        cur_t[1, 0] += source._last_alt_delta
-                    else:
-                        cur_t[1, 0] += delta_t[1, 0]
-                    
-                    cur_R = R.dot(cur_R)
-        
-        # --- OPTIMIZATION 3: Apply filter equations to smooth out jitter peaks ---
-        smooth_t = alpha * cur_t + (1.0 - alpha) * smooth_t
-        
-        traj_x.append(smooth_t[0, 0])
-        traj_z.append(smooth_t[2, 0])
-        
-        frame_vis = frame_curr.copy()
-        for pt in good_curr:
-            x, y = pt.ravel()
-            cv2.circle(frame_vis, (int(x), int(y)), 3, (0, 255, 0), -1)
-
-        if show_local_plots:
-            line.set_data(traj_x, traj_z)
-            ax.relim()
-            ax.autoscale_view()
-            fig.canvas.draw_idle()
-            fig.canvas.start_event_loop(0.001)
-            cv2.imshow("VO Camera Feed", frame_vis)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-        if shared_queue is not None:
-            # Pass the heavily filtered position arrays down the queue instead of raw noisy coordinates
-            real_x = float(smooth_t[0, 0])
-            real_y = -float(smooth_t[1, 0])  
-            real_z = float(smooth_t[2, 0])
-            
-            _, encoded_img = cv2.imencode('.jpg', frame_vis)
-            jpeg_bytes = encoded_img.tobytes()
-            
-            shared_queue.put({
-                "frame_idx": frame_counter,
-                "total_frames": estimated_total_frames,
-                "estimated": [real_x, real_y, real_z],
-                "distance_from_start": float(np.linalg.norm(smooth_t)),
-                "video_frame": jpeg_bytes
-            })
-
-        if len(good_curr) < 200:
-            pts_curr = cv2.goodFeaturesToTrack(gray_curr, maxCorners=1000, qualityLevel=0.01, minDistance=10)
-            
-        gray_prev = gray_curr
-        pts_prev = pts_curr
-
-    if show_local_plots:
-        cv2.destroyAllWindows()
-        plt.ioff()
-        plt.show()
+ 
+    # FIX: Only spawn a background thread-buffer if reading from live hardware streams
+    frame_buffer = None
+    if mode != "KITTI":
+        frame_buffer = ThreadFrameBuffer(source, maxsize=32)
+        frame_buffer.start()
+ 
+    try:
+        _vo_worker(frame_buffer, source, mode, shared_queue, show_local_plots, estimated_total_frames)
+    finally:
+        if frame_buffer is not None:
+            frame_buffer.stop()
 
             
 if __name__ == "__main__":
