@@ -15,6 +15,24 @@ from scipy.spatial.transform import Rotation as SciPyRot
 from scipy.optimize import least_squares
 from ahrs.filters import Madgwick
 
+class AH2Adrone:
+    def __init__(self, window_size=5):
+        self.K = np.array([[921.0,   0.0, 480.0],
+                           [  0.0, 921.0, 360.0],
+                           [  0.0,   0.0,   1.0]], dtype=np.float64)
+        self.prev_frame = None
+        self.prev_kp = None
+        self.prev_des = None
+        self.cur_pose = np.eye(4, dtype=np.float64)
+        
+        self.orb = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8, edgeThreshold=31)
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        
+        # --- BUNDLE ADJUSTMENT WINDOW STORAGE ---
+        self.window_size = window_size
+        self.pose_history = []  # Stores past 4x4 relative camera matrices
+        self.points_2d_history = []  # Stores matched pixel coordinates for optimization
+
 class LiveTelloVIOWithBA:
     def __init__(self, window_size=5):
         self.K = np.array([[921.0,   0.0, 480.0],
@@ -32,6 +50,32 @@ class LiveTelloVIOWithBA:
         self.window_size = window_size
         self.pose_history = []  # Stores past 4x4 relative camera matrices
         self.points_2d_history = []  # Stores matched pixel coordinates for optimization
+        
+    def reprojection_error_vector(self, params, points_3d, points_2d):
+        """
+        The mathematical cost function minimized by Bundle Adjustment.
+        Adjusts the 3D translation vector to minimize pixel reprojection drift.
+        """
+        # Extract the optimized translation components from the flat parameter array
+        t_opt = params[:3].reshape(3, 1)
+        R = params[3:].reshape(3, 3)
+        
+        # Project 3D space points back into 2D camera coordinates using the tested pose
+        projected_points = []
+        for pt_3d in points_3d:
+            # Transform point to camera frame: P_cam = R * P_world + t
+            pt_cam = R @ pt_3d.reshape(3, 1) + t_opt
+            if pt_cam[2, 0] == 0:
+                pt_cam[2, 0] = 0.01  # Safeguard against division by zero depth
+            
+            # Project onto image sensor plane using Intrinsic Matrix K
+            x_pixel = (self.K[0, 0] * pt_cam[0, 0] / pt_cam[2, 0]) + self.K[0, 2]
+            y_pixel = (self.K[1, 1] * pt_cam[1, 0] / pt_cam[2, 0]) + self.K[1, 2]
+            projected_points.append([x_pixel, y_pixel])
+            
+        projected_points = np.array(projected_points)
+        # Return the flat residual vector (the distances between measured and projected pixels)
+        return (projected_points - points_2d).flatten()
         
     def reprojection_error_vector(self, params, points_3d, points_2d):
         """
