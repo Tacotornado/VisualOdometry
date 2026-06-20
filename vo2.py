@@ -5,6 +5,7 @@ import threading
 import queue
 import numpy as np
 import cv2
+from scipy.optimize import least_squares
 from abc import ABC, abstractmethod
 
 # Explicit djitellopy bindings from your connection setup
@@ -215,11 +216,17 @@ class TelloDroneSource(VideoSource):
 
 
 class VisualOdometryPipeline:
-    """Core Visual Odometry tracking engine that acts independently of video hardware protocols."""
+    """Core Visual Odometry tracking engine with Local Bundle Adjustment."""
     
     def __init__(self, source: VideoSource):
         self.source = source
         self.traj = np.zeros((600, 600, 3), dtype=np.uint8)
+        
+        # Reconstruct the Intrinsic Matrix (K) for 3D projection math
+        f, pp = self.source.get_calibration_data()
+        self.K = np.array([[f, 0, pp[0]],
+                           [0, f, pp[1]],
+                           [0, 0,    1]], dtype=np.float64)
 
     @staticmethod
     def _feature_detection(img):
@@ -238,111 +245,164 @@ class VisualOdometryPipeline:
                          criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
         pts_curr, status, _ = cv2.calcOpticalFlowPyrLK(img_prev, img_curr, pts_prev, None, **lk_params)
         
-        # Failsafe if optical flow completely drops
         if status is None:
             return np.array([]), np.array([]), np.array([])
             
         valid = (status.ravel() == 1)
         return pts_prev[valid], pts_curr[valid], status
 
+    @staticmethod
+    def _reprojection_error(params, pts_3d, pts_2d, K):
+        """
+        The cost function for Bundle Adjustment.
+        Takes 6 parameters (3 for rotation vector, 3 for translation),
+        projects the 3D points back onto the 2D image, and calculates the drift error.
+        """
+        rvec = params[:3]
+        tvec = params[3:6]
+        
+        # Project 3D points back to 2D camera plane
+        proj_pts, _ = cv2.projectPoints(pts_3d, rvec, tvec, K, None)
+        proj_pts = proj_pts.reshape(-1, 2)
+        
+        # Calculate distance between predicted 2D points and actual measured 2D points
+        return (proj_pts - pts_2d).ravel()
+
     def run(self):
-            img_1_c = self.source.get_next_frame()
-            img_2_c = self.source.get_next_frame()
+        img_1_c = self.source.get_next_frame()
+        img_2_c = self.source.get_next_frame()
 
-            if img_1_c is None or img_2_c is None:
-                print("Error: Empty video resources encountered on initialization.")
-                return -1
+        if img_1_c is None or img_2_c is None:
+            print("Error: Empty video resources encountered on initialization.")
+            return -1
 
-            img_1 = cv2.cvtColor(img_1_c, cv2.COLOR_BGR2GRAY)
-            img_2 = cv2.cvtColor(img_2_c, cv2.COLOR_BGR2GRAY)
+        img_1 = cv2.cvtColor(img_1_c, cv2.COLOR_BGR2GRAY)
+        img_2 = cv2.cvtColor(img_2_c, cv2.COLOR_BGR2GRAY)
 
-            points1 = self._feature_detection(img_1)
-            
-            # Guardfall for empty feature array
-            if len(points1) == 0:
-                print("[ERROR] Camera found 0 features. It might be facing a blank wall or the room is too dark.")
-                self.source.close()
-                return -1 
-            
-            points1, points2, status = self._feature_tracking(img_1, img_2, points1)
-
-            focal, pp = self.source.get_calibration_data()
-
-            E, mask = cv2.findEssentialMat(points2, points1, focal=focal, pp=pp, method=cv2.RANSAC, prob=0.999, threshold=1.0)
-            _, R, t, _ = cv2.recoverPose(E, points2, points1, focal=focal, pp=pp, mask=mask)
-
-            R_f = R.copy()
-            t_f = t.copy()
-
-            prev_image = img_2.copy()
-            prev_features = points2.copy()
-
-            cv2.namedWindow("Camera View", cv2.WINDOW_AUTOSIZE)
-            cv2.namedWindow("Trajectory", cv2.WINDOW_AUTOSIZE)
-
-            while self.source.get_frame_id() < MAX_FRAME:
-                curr_image_c = self.source.get_next_frame()
-                if curr_image_c is None:
-                    print(f"Ending pipeline execution at final frame count: {self.source.get_frame_id()}")
-                    break
-
-                curr_image = cv2.cvtColor(curr_image_c, cv2.COLOR_BGR2GRAY)
-                
-                prev_features, curr_features, status = self._feature_tracking(prev_image, curr_image, prev_features)
-                
-                # --- NEW: OPTICAL FLOW VISUALIZATION ---
-                # Draw tracking trails on the live color frame
-                if curr_features is not None and prev_features is not None:
-                    for i, (new, old) in enumerate(zip(curr_features, prev_features)):
-                        a, b = new.ravel()
-                        c, d = old.ravel()
-                        # Draw a green line representing the motion vector
-                        cv2.line(curr_image_c, (int(a), int(b)), (int(c), int(d)), (0, 255, 0), 2)
-                        # Draw a red dot at the current feature location
-                        cv2.circle(curr_image_c, (int(a), int(b)), 3, (0, 0, 255), -1)
-                # ---------------------------------------
-
-                E, mask = cv2.findEssentialMat(curr_features, prev_features, focal=focal, pp=pp, method=cv2.RANSAC, prob=0.999, threshold=1.0)
-                
-                # Failsafe in case RANSAC throws out all matches
-                if E is not None and E.shape == (3, 3):
-                    _, R, t, _ = cv2.recoverPose(E, curr_features, prev_features, focal=focal, pp=pp, mask=mask)
-
-                    scale = self.source.get_scale()
-
-                    if (scale > 0.1) or (isinstance(self.source, TelloDroneSource)):
-                        if isinstance(self.source, KittiDatasetSource) and not ((t[2, 0] > t[0, 0]) and (t[2, 0] > t[1, 0])):
-                            pass
-                        else:
-                            t_f = t_f + scale * (R_f.dot(t))
-                            R_f = R.dot(R_f)
-
-                # Re-detect new features if we drop below the threshold
-                if len(prev_features) < MIN_NUM_FEAT:
-                    prev_features = self._feature_detection(prev_image)
-                    prev_features, curr_features, status = self._feature_tracking(prev_image, curr_image, prev_features)
-
-                prev_image = curr_image.copy()
-                prev_features = curr_features.copy()
-
-                # Draw top-down trajectory map
-                x = int(t_f[0, 0]) + 300
-                y = int(-1 * t_f[2, 0]) + 500
-                cv2.circle(self.traj, (x, y), 1, (0, 0, 255), 2)
-
-                cv2.rectangle(self.traj, (10, 30), (550, 50), (0, 0, 0), cv2.FILLED)
-                text_str = f"Coords: x = {t_f[0,0]:.2f}m y = {t_f[1,0]:.2f}m z = {t_f[2,0]:.2f}m"
-                cv2.putText(self.traj, text_str, (10, 50), cv2.FONT_HERSHEY_PLAIN, 1.0, (255, 255, 255), 1, cv2.LINE_8)
-
-                cv2.imshow("Camera View", curr_image_c)
-                cv2.imshow("Trajectory", self.traj)
-
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-
-            cv2.destroyAllWindows()
+        points1 = self._feature_detection(img_1)
+        
+        if len(points1) == 0:
+            print("[ERROR] Camera found 0 features. It might be facing a blank wall or the room is too dark.")
             self.source.close()
-            return 0
+            return -1 
+        
+        points1, points2, status = self._feature_tracking(img_1, img_2, points1)
+
+        focal, pp = self.source.get_calibration_data()
+
+        E, mask = cv2.findEssentialMat(points2, points1, focal=focal, pp=pp, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+        _, R, t, _ = cv2.recoverPose(E, points2, points1, focal=focal, pp=pp, mask=mask)
+
+        R_f = R.copy()
+        t_f = t.copy()
+
+        prev_image = img_2.copy()
+        prev_features = points2.copy()
+
+        cv2.namedWindow("Camera View", cv2.WINDOW_AUTOSIZE)
+        cv2.namedWindow("Trajectory", cv2.WINDOW_AUTOSIZE)
+
+        while self.source.get_frame_id() < MAX_FRAME:
+            curr_image_c = self.source.get_next_frame()
+            if curr_image_c is None:
+                print(f"Ending pipeline execution at final frame count: {self.source.get_frame_id()}")
+                break
+
+            curr_image = cv2.cvtColor(curr_image_c, cv2.COLOR_BGR2GRAY)
+            
+            prev_features, curr_features, status = self._feature_tracking(prev_image, curr_image, prev_features)
+            
+            # Optical Flow Visualization
+            if curr_features is not None and prev_features is not None:
+                for i, (new, old) in enumerate(zip(curr_features, prev_features)):
+                    a, b = new.ravel()
+                    c, d = old.ravel()
+                    cv2.line(curr_image_c, (int(a), int(b)), (int(c), int(d)), (0, 255, 0), 2)
+                    cv2.circle(curr_image_c, (int(a), int(b)), 3, (0, 0, 255), -1)
+
+            E, mask = cv2.findEssentialMat(curr_features, prev_features, focal=focal, pp=pp, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+            
+            if E is not None and E.shape == (3, 3):
+                _, R, t, mask_pose = cv2.recoverPose(E, curr_features, prev_features, focal=focal, pp=pp, mask=mask)
+
+                # ==========================================
+                # --- BUNDLE ADJUSTMENT (OPTIMIZATION) ---
+                # ==========================================
+                try:
+                    # 1. Convert Rotation Matrix to Rodrigues vector (required for cv2.projectPoints)
+                    rvec, _ = cv2.Rodrigues(R)
+                    
+                    # 2. Triangulate to find actual 3D points
+                    P1 = self.K @ np.hstack((np.eye(3), np.zeros((3, 1))))
+                    P2 = self.K @ np.hstack((R, t))
+                    
+                    # Extract only the valid points that RANSAC kept
+                    valid_pts1 = prev_features[mask_pose.ravel() > 0]
+                    valid_pts2 = curr_features[mask_pose.ravel() > 0]
+                    
+                    if len(valid_pts1) >= 10: # Need enough points to optimize
+                        pts_4d = cv2.triangulatePoints(P1, P2, valid_pts1.T, valid_pts2.T)
+                        pts_3d = (pts_4d[:3] / pts_4d[3]).T
+                        
+                        # 3. Setup parameters array: [rvec_x, rvec_y, rvec_z, t_x, t_y, t_z]
+                        initial_params = np.hstack((rvec.ravel(), t.ravel()))
+                        
+                        # 4. Run Levenberg-Marquardt Optimizer
+                        res = least_squares(
+                            self._reprojection_error, 
+                            initial_params, 
+                            args=(pts_3d, valid_pts2, self.K), 
+                            method='lm',
+                            max_nfev=15  # Hard cap iterations so the video feed doesn't stutter
+                        )
+                        
+                        # 5. Extract optimized values and overwrite R and t
+                        rvec_opt = res.x[:3]
+                        t_opt = res.x[3:6].reshape(3, 1)
+                        R_opt, _ = cv2.Rodrigues(rvec_opt)
+                        
+                        R = R_opt
+                        t = t_opt
+                except Exception as e:
+                    # If optimization mathematically fails (e.g., matrix singularity),
+                    # we just fall back to the raw un-optimized R and t to keep flying
+                    pass
+                # ==========================================
+
+                scale = self.source.get_scale()
+
+                if (scale > 0.1) or (isinstance(self.source, TelloDroneSource)):
+                    if isinstance(self.source, KittiDatasetSource) and not ((t[2, 0] > t[0, 0]) and (t[2, 0] > t[1, 0])):
+                        pass
+                    else:
+                        t_f = t_f + scale * (R_f.dot(t))
+                        R_f = R.dot(R_f)
+
+            if len(prev_features) < MIN_NUM_FEAT:
+                prev_features = self._feature_detection(prev_image)
+                prev_features, curr_features, status = self._feature_tracking(prev_image, curr_image, prev_features)
+
+            prev_image = curr_image.copy()
+            prev_features = curr_features.copy()
+
+            # Render top-down trajectory map
+            x = int(t_f[0, 0]) + 300
+            y = int(-1 * t_f[2, 0]) + 500
+            cv2.circle(self.traj, (x, y), 1, (255, 0, 255), 2) # Changed to Magenta so you know BA is active
+
+            cv2.rectangle(self.traj, (10, 30), (550, 50), (0, 0, 0), cv2.FILLED)
+            text_str = f"BA Opt Coords: x={t_f[0,0]:.2f}m y={t_f[1,0]:.2f}m z={t_f[2,0]:.2f}m"
+            cv2.putText(self.traj, text_str, (10, 50), cv2.FONT_HERSHEY_PLAIN, 1.0, (255, 255, 255), 1, cv2.LINE_8)
+
+            cv2.imshow("Camera View", curr_image_c)
+            cv2.imshow("Trajectory", self.traj)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        cv2.destroyAllWindows()
+        self.source.close()
+        return 0
 
 
 if __name__ == "__main__":
