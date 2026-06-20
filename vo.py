@@ -5,7 +5,9 @@ import threading
 import queue
 import numpy as np
 import cv2
+from scipy.optimize import least_squares
 from abc import ABC, abstractmethod
+import matplotlib.pyplot as plt
 
 # Explicit djitellopy bindings from your connection setup
 from djitellopy import Tello
@@ -215,11 +217,26 @@ class TelloDroneSource(VideoSource):
 
 
 class VisualOdometryPipeline:
-    """Core Visual Odometry tracking engine that acts independently of video hardware protocols."""
+    """Core Visual Odometry tracking engine with Local Bundle Adjustment."""
     
     def __init__(self, source: VideoSource):
-        self.source = source
-        self.traj = np.zeros((600, 600, 3), dtype=np.uint8)
+            self.source = source
+            # Keeping this if you still want to see raw feature tracking
+            self.traj = np.zeros((600, 600, 3), dtype=np.uint8) 
+            
+            f, pp = self.source.get_calibration_data()
+            self.K = np.array([[f, 0, pp[0]],
+                            [0, f, pp[1]],
+                            [0, 0,    1]], dtype=np.float64)
+
+            # Matplotlib Setup
+            plt.ion() 
+            self.fig, self.ax = plt.subplots(figsize=(6, 6))
+            self.ax.set_title("Drone Trajectory (Top-Down)")
+            self.ax.set_xlabel("X (meters)")
+            self.ax.set_ylabel("Z (meters)")
+            self.line, = self.ax.plot([], [], 'm-o', markersize=2, linewidth=1)
+            self.path_x, self.path_y = [], []
 
     @staticmethod
     def _feature_detection(img):
@@ -238,120 +255,148 @@ class VisualOdometryPipeline:
                          criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
         pts_curr, status, _ = cv2.calcOpticalFlowPyrLK(img_prev, img_curr, pts_prev, None, **lk_params)
         
-        # Failsafe if optical flow completely drops
         if status is None:
             return np.array([]), np.array([]), np.array([])
             
         valid = (status.ravel() == 1)
         return pts_prev[valid], pts_curr[valid], status
 
+    @staticmethod
+    def _reprojection_error(params, pts_3d, pts_2d, K):
+        """
+        The cost function for Bundle Adjustment.
+        Takes 6 parameters (3 for rotation vector, 3 for translation),
+        projects the 3D points back onto the 2D image, and calculates the drift error.
+        """
+        rvec = params[:3]
+        tvec = params[3:6]
+        
+        # Project 3D points back to 2D camera plane
+        proj_pts, _ = cv2.projectPoints(pts_3d, rvec, tvec, K, None)
+        proj_pts = proj_pts.reshape(-1, 2)
+        
+        # Calculate distance between predicted 2D points and actual measured 2D points
+        return (proj_pts - pts_2d).ravel()
+
     def run(self):
-            img_1_c = self.source.get_next_frame()
-            img_2_c = self.source.get_next_frame()
+        # Initial frame capture
+        img_1_c = self.source.get_next_frame()
+        img_2_c = self.source.get_next_frame()
 
-            if img_1_c is None or img_2_c is None:
-                print("Error: Empty video resources encountered on initialization.")
-                return -1
+        if img_1_c is None or img_2_c is None:
+            print("Error: Empty video resources encountered on initialization.")
+            return -1
 
-            img_1 = cv2.cvtColor(img_1_c, cv2.COLOR_BGR2GRAY)
-            img_2 = cv2.cvtColor(img_2_c, cv2.COLOR_BGR2GRAY)
+        img_1 = cv2.cvtColor(img_1_c, cv2.COLOR_BGR2GRAY)
+        img_2 = cv2.cvtColor(img_2_c, cv2.COLOR_BGR2GRAY)
 
-            points1 = self._feature_detection(img_1)
-            
-            # Guardfall for empty feature array
-            if len(points1) == 0:
-                print("[ERROR] Camera found 0 features. It might be facing a blank wall or the room is too dark.")
-                self.source.close()
-                return -1 
-            
-            points1, points2, status = self._feature_tracking(img_1, img_2, points1)
-
-            focal, pp = self.source.get_calibration_data()
-
-            E, mask = cv2.findEssentialMat(points2, points1, focal=focal, pp=pp, method=cv2.RANSAC, prob=0.999, threshold=1.0)
-            _, R, t, _ = cv2.recoverPose(E, points2, points1, focal=focal, pp=pp, mask=mask)
-
-            R_f = R.copy()
-            t_f = t.copy()
-
-            prev_image = img_2.copy()
-            prev_features = points2.copy()
-
-            cv2.namedWindow("Camera View", cv2.WINDOW_AUTOSIZE)
-            cv2.namedWindow("Trajectory", cv2.WINDOW_AUTOSIZE)
-
-            while self.source.get_frame_id() < MAX_FRAME:
-                curr_image_c = self.source.get_next_frame()
-                if curr_image_c is None:
-                    print(f"Ending pipeline execution at final frame count: {self.source.get_frame_id()}")
-                    break
-
-                curr_image = cv2.cvtColor(curr_image_c, cv2.COLOR_BGR2GRAY)
-                
-                prev_features, curr_features, status = self._feature_tracking(prev_image, curr_image, prev_features)
-                
-                # --- NEW: OPTICAL FLOW VISUALIZATION ---
-                # Draw tracking trails on the live color frame
-                if curr_features is not None and prev_features is not None:
-                    for i, (new, old) in enumerate(zip(curr_features, prev_features)):
-                        a, b = new.ravel()
-                        c, d = old.ravel()
-                        # Draw a green line representing the motion vector
-                        cv2.line(curr_image_c, (int(a), int(b)), (int(c), int(d)), (0, 255, 0), 2)
-                        # Draw a red dot at the current feature location
-                        cv2.circle(curr_image_c, (int(a), int(b)), 3, (0, 0, 255), -1)
-                # ---------------------------------------
-
-                E, mask = cv2.findEssentialMat(curr_features, prev_features, focal=focal, pp=pp, method=cv2.RANSAC, prob=0.999, threshold=1.0)
-                
-                # Failsafe in case RANSAC throws out all matches
-                if E is not None and E.shape == (3, 3):
-                    _, R, t, _ = cv2.recoverPose(E, curr_features, prev_features, focal=focal, pp=pp, mask=mask)
-
-                    scale = self.source.get_scale()
-
-                    if (scale > 0.1) or (isinstance(self.source, TelloDroneSource)):
-                        if isinstance(self.source, KittiDatasetSource) and not ((t[2, 0] > t[0, 0]) and (t[2, 0] > t[1, 0])):
-                            pass
-                        else:
-                            t_f = t_f + scale * (R_f.dot(t))
-                            R_f = R.dot(R_f)
-
-                # Re-detect new features if we drop below the threshold
-                if len(prev_features) < MIN_NUM_FEAT:
-                    prev_features = self._feature_detection(prev_image)
-                    prev_features, curr_features, status = self._feature_tracking(prev_image, curr_image, prev_features)
-
-                prev_image = curr_image.copy()
-                prev_features = curr_features.copy()
-
-                # Draw top-down trajectory map
-                x = int(t_f[0, 0]) + 300
-                y = int(-1 * t_f[2, 0]) + 500
-                cv2.circle(self.traj, (x, y), 1, (0, 0, 255), 2)
-
-                cv2.rectangle(self.traj, (10, 30), (550, 50), (0, 0, 0), cv2.FILLED)
-                text_str = f"Coords: x = {t_f[0,0]:.2f}m y = {t_f[1,0]:.2f}m z = {t_f[2,0]:.2f}m"
-                cv2.putText(self.traj, text_str, (10, 50), cv2.FONT_HERSHEY_PLAIN, 1.0, (255, 255, 255), 1, cv2.LINE_8)
-
-                cv2.imshow("Camera View", curr_image_c)
-                cv2.imshow("Trajectory", self.traj)
-
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-
-            cv2.destroyAllWindows()
+        points1 = self._feature_detection(img_1)
+        
+        if len(points1) == 0:
+            print("[ERROR] Camera found 0 features. Check lighting or drone orientation.")
             self.source.close()
-            return 0
+            return -1 
+        
+        # Initial tracking step
+        points1, points2, status = self._feature_tracking(img_1, img_2, points1)
+        focal, pp = self.source.get_calibration_data()
+
+        # Pose recovery
+        E, mask = cv2.findEssentialMat(points2, points1, focal=focal, pp=pp, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+        _, R, t, _ = cv2.recoverPose(E, points2, points1, focal=focal, pp=pp, mask=mask)
+
+        R_f = R.copy()
+        t_f = t.copy()
+
+        prev_image = img_2.copy()
+        prev_features = points2.copy()
+
+        cv2.namedWindow("Camera View", cv2.WINDOW_AUTOSIZE)
+
+        # Main Pipeline Loop
+        while self.source.get_frame_id() < MAX_FRAME:
+            curr_image_c = self.source.get_next_frame()
+            if curr_image_c is None:
+                print(f"Ending pipeline: Final frame reached.")
+                break
+
+            curr_image = cv2.cvtColor(curr_image_c, cv2.COLOR_BGR2GRAY)
+            prev_features, curr_features, status = self._feature_tracking(prev_image, curr_image, prev_features)
+            
+            # Draw flow vectors on color frame
+            if curr_features is not None and prev_features is not None:
+                for i, (new, old) in enumerate(zip(curr_features, prev_features)):
+                    a, b = new.ravel()
+                    c, d = old.ravel()
+                    cv2.line(curr_image_c, (int(a), int(b)), (int(c), int(d)), (0, 255, 0), 2)
+
+            E, mask = cv2.findEssentialMat(curr_features, prev_features, focal=focal, pp=pp, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+            
+            if E is not None and E.shape == (3, 3):
+                _, R, t, mask_pose = cv2.recoverPose(E, curr_features, prev_features, focal=focal, pp=pp, mask=mask)
+
+                # Bundle Adjustment Optimization
+                try:
+                    rvec, _ = cv2.Rodrigues(R)
+                    P1 = self.K @ np.hstack((np.eye(3), np.zeros((3, 1))))
+                    P2 = self.K @ np.hstack((R, t))
+                    
+                    valid_pts1 = prev_features[mask_pose.ravel() > 0]
+                    valid_pts2 = curr_features[mask_pose.ravel() > 0]
+                    
+                    if len(valid_pts1) >= 10:
+                        pts_4d = cv2.triangulatePoints(P1, P2, valid_pts1.T, valid_pts2.T)
+                        pts_3d = (pts_4d[:3] / pts_4d[3]).T
+                        
+                        initial_params = np.hstack((rvec.ravel(), t.ravel()))
+                        res = least_squares(self._reprojection_error, initial_params, 
+                                            args=(pts_3d, valid_pts2, self.K), 
+                                            method='lm', max_nfev=15)
+                        
+                        R, _ = cv2.Rodrigues(res.x[:3])
+                        t = res.x[3:6].reshape(3, 1)
+                except Exception:
+                    pass 
+
+                scale = self.source.get_scale()
+                if (scale > 0.1) or (isinstance(self.source, TelloDroneSource)):
+                    t_f = t_f + scale * (R_f.dot(t))
+                    R_f = R.dot(R_f)
+
+            # Update Matplotlib Trajectory Plot
+            self.path_x.append(t_f[0, 0])
+            self.path_y.append(t_f[2, 0])
+            self.line.set_xdata(self.path_x)
+            self.line.set_ydata(self.path_y)
+            
+            # Dynamic Axis Scaling
+            self.ax.set_xlim(min(self.path_x) - 10, max(self.path_x) + 10)
+            self.ax.set_ylim(min(self.path_y) - 10, max(self.path_y) + 10)
+            self.fig.canvas.draw()
+            self.fig.canvas.flush_events()
+
+            # Refresh Frames
+            cv2.imshow("Camera View", curr_image_c)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+            prev_image = curr_image.copy()
+            prev_features = curr_features.copy()
+
+        cv2.destroyAllWindows()
+        plt.ioff()
+        plt.show()
+        self.source.close()
+        return 0
 
 
 if __name__ == "__main__":
     # --- Option A: Run using offline KITTI dataset sequence folder ---
-    # kitti_path = r"D:\VisualOdometry\VisualOdometry\data\Kitti\flight_path_00"
-    # source = KittiDatasetSource(kitti_path)
+    kitti_path = r"D:\VisualOdometry\VisualOdometry\data\Kitti\flight_path_00"
+    #source = KittiDatasetSource(kitti_path)
     
     # --- Option B: Run via your designated hardware pipeline queue layout ---
-    source = TelloDroneSource(default_scale=10.0)
+    source = TelloDroneSource(default_scale=5.0)
     
     pipeline = VisualOdometryPipeline(source)
     pipeline.run()
